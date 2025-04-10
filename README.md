@@ -3,16 +3,16 @@
 The goal of this repo is to set up metrics and strategies to evaluate how to optimally sample ESM3 for protein design.
 
 ### Objectives
-- [] Choose proteins for testing
-- [] Set up metrics/eval methods
-- [] Set up sampling methods
+- [x] Choose proteins for testing - CASP15, single domains only. T1137 thrown out since they're really long and only make sense in oligomeric context.
+- [ ] Set up metrics/eval methods
+- [ ] Set up sampling methods
 
 
 ### Metrics
-1. Foldability: RMSD of Structure --> Designed sequence --> ESMFolded Structure
-2. pLDDT
-3. pTM
-4. pAE
+1. Foldability: RMSD of (ESMFold predicted structure) --8x-->  ESM-IF designed sequence --> (ESMFolded Structure)
+2. pLDDT (ESM3)
+4. pAE (ESM3)
+3. pTM (ESMFold)
 6. (Sequence) Entropy
 7. (Sequence) Diversity
 

@@ -4,3 +4,6 @@ https://github.com/evolutionaryscale/esm/blob/main/cookbook/tutorials/3_gfp_desi
 "Besides, for both ss-match and cRMSD, we use 10 reference proteins randomly chosen from datasets in Dauparas et al. (2022) and report the mean of the results."
 Uehara, Masatoshi, Xingyu Su, Yulai Zhao, Xiner Li, Aviv Regev, Shuiwang Ji, Sergey Levine, and Tommaso Biancalani. 2025. “Reward-Guided Iterative Refinement in Diffusion Models at Test-Time with Applications to Protein and DNA Design.” arXiv [q-Bio.QM]. https://doi.org/10.48550/ARXIV.2502.14944.
 - just should make sure that it's outside the training set of ESM3. *Maybe choose 10 proteins solved in the last year*.
+
+"Iterative decoding and single-pass decoding have equivalent performance for structure prediction. We hypothesize that this is because ESM3 has a latent representation of structure, so whether structure tokens are decoded in a single pass or iteratively does not meaningfully change the sampling trajectory.
+ESM paper
