@@ -7,6 +7,7 @@ import random
 import os
 import sys
 from datetime import datetime
+from typing import Tuple
 
 from esm.sdk.api import (
     ESM3InferenceClient,
@@ -19,6 +20,7 @@ from esm.sdk.api import (
 )
 from esm.models.esm3 import ESM3
 from esm.tokenization import get_esm3_model_tokenizers
+from esm.sdk.forge import ESM3ForgeInferenceClient
 
 # Ensure TOKENIZERS_PATH environment variable is set or adjust path as needed
 # Assuming default installation location for tokenizers relative to esm package
@@ -71,12 +73,18 @@ class BaseDenoising(ABC):
     def __init__(self, client: ESM3InferenceClient):
         if isinstance(client, ESM3):
             self.tokenizers = client.tokenizers
+        elif isinstance(client, ESM3ForgeInferenceClient):
+            self.tokenizers = get_esm3_model_tokenizers(client.model)
         else:
-            raise ValueError("client must be an instance of ESM3")
+            raise ValueError(
+                "client must be an instance of ESM3 or ESM3ForgeInferenceClient"
+            )
+
         self.client = client
         self.track = "sequence"  # Default track
         self.printer = PrintFormatter()  # Add printer
         self.cost = 0  # Number of calls to the model
+        self.protein = None  # Placeholder for the protein object
         
     def add_noise(
         self,
@@ -165,7 +173,8 @@ class BaseDenoising(ABC):
             output = model_output
         
         output_track_tensor = getattr(output.protein_tensor, track)
-        predicted_token_id = output_track_tensor[position].item()
+        predicted_token_id = int(output_track_tensor[position].item())
+        print(type(predicted_token_id), predicted_token_id)
         predicted_token = getattr(self.tokenizers, self.track).decode(torch.tensor([predicted_token_id]))
         
         track_tensor[position] = output_track_tensor[position]
@@ -175,6 +184,17 @@ class BaseDenoising(ABC):
                           is_last=True, decrease_indent=True)
         return protein_tensor
     
+    def return_generation(
+        self,
+    ) -> Tuple[ESMProtein, int]:
+        """
+        Return function for generation.
+        Returns the following:
+        - protein: ESMProtein
+        - cost: int
+        """
+        return [self.protein, self.cost]
+
     @abstractmethod
     def get_next_position(
         self,
@@ -319,6 +339,7 @@ class EntropyBasedDenoising(BaseDenoising):
         assert not isinstance(decoded_protein, ESMProteinError)
         self.printer.print(f"Final denoised sequence: {decoded_protein.sequence}")
         self.printer.print(f"Total model calls: {self.cost}", is_last=True, decrease_indent=True)
+        self.protein = decoded_protein
         return decoded_protein
 
 class MaxProbBasedDenoising(BaseDenoising):
@@ -337,17 +358,17 @@ class MaxProbBasedDenoising(BaseDenoising):
             output = self.client.forward_and_sample(
                 protein_tensor,
                 sampling_configuration=SamplingConfig(
-                    sequence=SamplingTrackConfig(temperature=1.0, topk_logprobs=5),
-                    structure=SamplingTrackConfig(temperature=1.0, topk_logprobs=5),
+                    sequence=SamplingTrackConfig(temperature=1.0, top_p=1.0),
+                    structure=SamplingTrackConfig(temperature=1.0, top_p=1.0),
                 )
             )
             self.cost += 1
             assert not isinstance(output, ESMProteinError)
         else:
             output = model_output
-        
+        print("Output:", output)
         max_probs = getattr(output.top_prob, track)
-        self.printer.print(f"Raw probabilities: {max_probs}")
+        self.printer.print(f"Top probabilities at each position: {max_probs}")
         
         # Mask probabilities of already unmasked positions
         track_tensor = getattr(protein_tensor, track)
@@ -403,8 +424,8 @@ class MaxProbBasedDenoising(BaseDenoising):
             output = self.client.forward_and_sample(
                 protein_tensor,
                 sampling_configuration=SamplingConfig(
-                    sequence=SamplingTrackConfig(temperature=1.0, topk_logprobs=5),
-                    structure=SamplingTrackConfig(temperature=1.0, topk_logprobs=5),
+                    sequence=SamplingTrackConfig(temperature=1.0, top_p=1.0),
+                    structure=SamplingTrackConfig(temperature=1.0, top_p=1.0),
                 )
             )
             self.cost += 1

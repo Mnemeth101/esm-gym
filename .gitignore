@@ -1,5 +1,5 @@
 data/
 .env
 .DS_Store
-__pycache__/denoising_strategies.cpython-310.pyc
+__pycache__/
 denoising_outputs/
