@@ -1,13 +1,16 @@
 from esm.sdk.api import (
     ESM3InferenceClient,
     ESMProtein,
-    LogitsConfig
+    ESMProteinError,
+    LogitsConfig,
+    GenerationConfig
 )
 import torch.nn.functional as F
 import math  # Add import for math
+from typing import List
 
-### Metrics
-def UACCE(client: ESM3InferenceClient, protein: ESMProtein, verbose: bool = False) -> float:
+### Single Metrics - metrics for a single protein
+def single_metric_UACCE(client: ESM3InferenceClient, protein: ESMProtein, verbose: bool = False) -> float:
     """
     Calculate unmask-aggregated-categorical-cross-entropy (uCCE) for a protein sequence.
     
@@ -105,7 +108,427 @@ def UACCE(client: ESM3InferenceClient, protein: ESMProtein, verbose: bool = Fals
     
     return ucce
 
+def single_metric_average_pLDDT(protein: ESMProtein) -> float:
+    """
+    Calculate pLDDT score for a protein sequence averaged over all residues.
+    
+    Args:
+        protein: Protein sequence to evaluate
+    
+    Returns:
+        float: The calculated pLDDT score
+    """
+    plddts = protein.plddt
+    if plddts is None:
+        raise ValueError("pLDDT scores are not available for this protein.")
 
-### Benchmarking run
+    plddt = plddts.mean()
+    return plddt
+
+def single_metric_pTM(protein: ESMProtein) -> float:
+    """
+    Return the pTM score for a protein structure.
+    """
+    pTM = protein.ptm
+    if pTM is None:
+        raise ValueError("pTM scores are not available for this protein.")
+    
+    return pTM
+
+def single_metric_foldability(client: ESM3InferenceClient, protein: ESMProtein, num_samples: int = 5, verbose: bool = False) -> float:
+    """
+    Foldability is a measure of how well a protein sequence can fold into a stable structure.
+    
+    We define foldability as the percentage of sequences satisfying:
+    - pLDDT > 80 (per-residue confidence)
+    - pTM > 0.7 (template modeling score)
+    - pAE < 10 (predicted aligned error - not directly measured here)
+    
+    This method uses the existing sequence from the input protein and tests these criteria.
+    
+    Args:
+        client: Client with inference capability
+        protein: Protein with sequence to evaluate
+        num_samples: Number of samples to test (default: 5)
+        verbose: Whether to print detailed information during execution
+        
+    Returns:
+        float: The percentage of samples that satisfy the foldability criteria
+    """
+    # Validate that the protein has a sequence
+    if protein.sequence is None:
+        raise ValueError("Protein sequence is not available for this protein.")
+    
+    def just_keep_sequence(protein: ESMProtein) -> ESMProtein:
+        protein_copy = protein.copy()
+        protein_copy.structure = None
+        protein_copy.plddt = None
+        protein_copy.ptm = None
+        protein_copy.secondary_structure = None
+        protein_copy.sasa = None
+        protein_copy.functional_annotations = None
+        return protein_copy
+
+    original_protein = protein.copy()
+    successful_count = 0
+    
+    if verbose:
+        print(f"Testing foldability with {num_samples} samples")
+        print(f"Using sequence: {original_protein.sequence}")
+        
+    for i in range(num_samples):
+        if verbose:
+            print(f"Sample {i+1}/{num_samples}")
+            
+        try:
+            # Start with just the sequence from the original protein
+            protein = just_keep_sequence(original_protein)
+            
+            # Predict the structure of the sequence
+            protein = client.generate(
+                input=protein,
+                config=GenerationConfig(track="structure", num_steps=1),
+            )
+            if isinstance(protein, ESMProteinError):
+                raise ValueError("Protein structure generation failed.")
+            
+            # Check foldability criteria
+            plddt = protein.plddt.mean()
+            ptm = protein.ptm
+            
+            if verbose:
+                print(f"  pLDDT: {plddt:.2f}, pTM: {ptm:.2f}")
+                
+            # Check if this sample meets all criteria
+            if plddt > 80 and ptm > 0.7:
+                successful_count += 1
+                if verbose:
+                    print("  ✓ Sample meets foldability criteria")
+            else:
+                if verbose:
+                    print("  ✗ Sample does not meet foldability criteria")
+                    
+        except ValueError as e:
+            if verbose:
+                print(f"  Error in sample {i+1}: {str(e)}")
+    
+    # Calculate foldability as percentage of successful samples
+    foldability = successful_count / num_samples if num_samples > 0 else 0.0
+    
+    if verbose:
+        print(f"Foldability score: {foldability * 100:.1f}% ({successful_count}/{num_samples} samples passed)")
+        
+    return foldability
+
+
+### Aggregated Metrics - metrics over all proteins generated using a denoising strategy
+def aggregated_metric_entropy(proteins: List[str], position_specific=True, verbose=False):
+    """
+    Calculate the entropy of protein sequences generated over N runs of a denoising strategy.
+    
+    Args:
+        proteins: List of protein sequences to evaluate (as strings)
+        position_specific: If True, calculate position-specific entropy; otherwise global
+        verbose: Whether to print detailed information
+        
+    Returns:
+        float or list: Position-specific entropy (list) or global entropy (float)
+    """
+    import numpy as np
+    from collections import Counter
+    
+    if not proteins or len(proteins) == 0:
+        raise ValueError("No protein sequences provided")
+        
+    # Define the standard amino acid alphabet
+    amino_acids = "ACDEFGHIKLMNPQRSTVWYXZ"
+    
+    if position_specific:
+        # Make sure all sequences are the same length
+        seq_len = len(proteins[0])
+        if not all(len(seq) == seq_len for seq in proteins):
+            raise ValueError("All protein sequences must be the same length for position-specific entropy")
+            
+        # Calculate position-specific entropy
+        entropies = []
+        
+        for pos in range(seq_len):
+            # Count amino acids at this position
+            pos_aas = [seq[pos] for seq in proteins]
+            counts = Counter(pos_aas)
+            
+            # Calculate entropy at this position
+            total_count = len(proteins)
+            pos_entropy = 0
+            
+            for aa in amino_acids:
+                prob = counts.get(aa, 0) / total_count
+                if prob > 0:
+                    pos_entropy -= prob * math.log2(prob)
+                    
+            entropies.append(pos_entropy)
+            
+            if verbose and pos < 5:  # Show first few positions
+                print(f"Position {pos}: entropy = {pos_entropy:.4f}, distribution: {counts}")
+                
+        if verbose:
+            print(f"Average position-specific entropy: {np.mean(entropies):.4f}")
+        
+        return entropies
+    else:
+        # Calculate global amino acid distribution entropy
+        all_aas = "".join(proteins)
+        counts = Counter(all_aas)
+        
+        # Calculate entropy
+        total_count = len(all_aas)
+        entropy = 0
+        
+        for aa in amino_acids:
+            prob = counts.get(aa, 0) / total_count
+            if prob > 0:
+                entropy -= prob * math.log2(prob)
+                
+        if verbose:
+            print(f"Global entropy: {entropy:.4f}")
+            print(f"Amino acid distribution: {counts}")
+            
+        return entropy
+
+def levenshtein_distance(seq1, seq2):
+    """
+    Calculate the Levenshtein (edit) distance between two sequences.
+    
+    Args:
+        seq1, seq2: The two sequences to compare
+        
+    Returns:
+        int: The edit distance
+    """
+    # Create a matrix of size (len(seq1)+1) x (len(seq2)+1)
+    rows, cols = len(seq1) + 1, len(seq2) + 1
+    dist = [[0 for _ in range(cols)] for _ in range(rows)]
+    
+    # Initialize the first row and column
+    for i in range(rows):
+        dist[i][0] = i
+    for j in range(cols):
+        dist[0][j] = j
+        
+    # Fill the matrix
+    for i in range(1, rows):
+        for j in range(1, cols):
+            cost = 0 if seq1[i-1] == seq2[j-1] else 1
+            dist[i][j] = min(
+                dist[i-1][j] + 1,      # deletion
+                dist[i][j-1] + 1,      # insertion
+                dist[i-1][j-1] + cost  # substitution
+            )
+            
+    return dist[rows-1][cols-1]
+
+def aggregated_metric_diversity(proteins: List[str], method="levenshtein", verbose=False):
+    """
+    Calculate the diversity of protein sequences generated over N runs of a denoising strategy.
+    
+    Args:
+        proteins: List of protein sequences to evaluate (as strings)
+        method: Method to calculate diversity:
+                "levenshtein" - average normalized Levenshtein distance
+                "hamming" - average normalized Hamming distance (sequences must be same length)
+                "identity" - average pairwise identity percentage (1 - identity)
+        verbose: Whether to print detailed information
+        
+    Returns:
+        float: Diversity score between 0 (identical) and 1 (maximum diversity)
+    """
+    import numpy as np
+    
+    if not proteins or len(proteins) < 2:
+        raise ValueError("Need at least 2 protein sequences to calculate diversity")
+    
+    num_proteins = len(proteins)
+    distances = []
+    
+    for i in range(num_proteins):
+        for j in range(i+1, num_proteins):
+            seq1 = proteins[i]
+            seq2 = proteins[j]
+            
+            if method == "levenshtein":
+                # Levenshtein (edit) distance
+                distance = levenshtein_distance(seq1, seq2)
+                # Normalize by the length of the longer sequence
+                normalized_distance = distance / max(len(seq1), len(seq2))
+                
+            elif method == "hamming":
+                # Hamming distance (sequences must be same length)
+                if len(seq1) != len(seq2):
+                    raise ValueError("All sequences must be the same length for Hamming distance")
+                distance = sum(c1 != c2 for c1, c2 in zip(seq1, seq2))
+                normalized_distance = distance / len(seq1)
+                
+            elif method == "identity":
+                # Sequence identity percentage
+                if len(seq1) != len(seq2):
+                    raise ValueError("All sequences must be the same length for identity calculation")
+                identity = sum(c1 == c2 for c1, c2 in zip(seq1, seq2)) / len(seq1)
+                normalized_distance = 1 - identity
+                
+            else:
+                raise ValueError(f"Unknown diversity method: {method}")
+                
+            distances.append(normalized_distance)
+            
+            if verbose and len(distances) <= 3:  # Show first few comparisons
+                print(f"Distance between sequence {i} and {j}: {normalized_distance:.4f}")
+    
+    # Calculate average distance
+    avg_distance = np.mean(distances)
+    
+    if verbose:
+        print(f"Average {method} distance: {avg_distance:.4f} (from {len(distances)} comparisons)")
+        print(f"Min distance: {np.min(distances):.4f}, Max distance: {np.max(distances):.4f}")
+        
+    return avg_distance
+
+def aggregated_cosine_similarities(proteins: List[str], original_protein: str, verbose=False):
+    """
+    Calculate cosine similarities between embeddings of generated proteins and an original protein.
+    
+    Args:
+        proteins: List of protein sequences to evaluate (as strings)
+        original_protein: The original protein sequence to compare against
+        verbose: Whether to print detailed information
+        
+    Returns:
+        List[float]: Cosine similarities between each protein and the original protein
+    """
+    import numpy as np
+    import torch
+    import torch.nn.functional as F
+    from esm.sdk.forge import ESM3ForgeInferenceClient
+    from esm.sdk.api import ESMProtein, LogitsConfig
+    import os
+    
+    # Get API token from environment variable or prompt user
+    token = os.environ.get("ESM_FORGE_API_KEY")
+    if token is None:
+        raise ValueError("ESM_FORGE_API_KEY environment variable not set. Please set it to your Forge API token.")
+    
+    # Initialize client
+    if verbose:
+        print("Initializing ESM-C forge client...")
+    forge_client = ESM3ForgeInferenceClient(model="esmc-6b-2024-12", url="https://forge.evolutionaryscale.ai", token=token)
+    
+    # Generate embedding for the original protein
+    if verbose:
+        print(f"Generating embedding for original protein (length: {len(original_protein)})")
+    
+    original_protein_obj = ESMProtein(sequence=original_protein)
+    original_tensor = forge_client.encode(original_protein_obj)
+    original_output = forge_client.logits(original_tensor, config=LogitsConfig(return_embeddings=True))
+    
+    # Get the embedding vector (average across all layers for robust representation)
+    original_embedding = original_output.embeddings.mean(dim=1).squeeze().detach()  # Shape: [2560]
+    
+    # Normalize the embedding
+    original_embedding_norm = F.normalize(original_embedding, p=2, dim=0)
+    
+    similarities = []
+    
+    # Calculate similarities for each protein
+    for i, protein_seq in enumerate(proteins):
+        if verbose and (i == 0 or i % 5 == 0):
+            print(f"Processing protein {i+1}/{len(proteins)} (length: {len(protein_seq)})")
+            
+        try:
+            # Generate embedding for this protein
+            protein_obj = ESMProtein(sequence=protein_seq)
+            protein_tensor = forge_client.encode(protein_obj)
+            protein_output = forge_client.logits(protein_tensor, config=LogitsConfig(return_embeddings=True))
+            
+            # Get the embedding vector (average across all layers)
+            protein_embedding = protein_output.embeddings.mean(dim=1).squeeze().detach()  # Shape: [2560]
+            
+            # Normalize the embedding
+            protein_embedding_norm = F.normalize(protein_embedding, p=2, dim=0)
+            
+            # Calculate cosine similarity (dot product of normalized vectors)
+            similarity = torch.dot(original_embedding_norm, protein_embedding_norm).item()
+            similarities.append(similarity)
+            
+            if verbose and i < 3:  # Show first few similarities
+                print(f"  Similarity between original and protein {i+1}: {similarity:.4f}")
+                
+        except Exception as e:
+            if verbose:
+                print(f"Error processing protein {i+1}: {e}")
+            similarities.append(None)
+    
+    if verbose:
+        valid_similarities = [s for s in similarities if s is not None]
+        if valid_similarities:
+            print(f"Average similarity: {np.mean(valid_similarities):.4f}")
+            print(f"Min similarity: {np.min(valid_similarities):.4f}")
+            print(f"Max similarity: {np.max(valid_similarities):.4f}")
+    
+    return similarities
+
+### Benchmarking run utils
 def get_smallest_pdb_file():
-    pass
+    """
+    Find the PDB file with the fewest number of residues in ./data/casp15_monomers_without_T1137
+    Turns out to be T1119-D1.pdb!
+    
+    Returns:
+        str: Path to the PDB file with fewest residues
+    """
+    import os
+    import glob
+    from Bio.PDB import PDBParser
+    
+    # Define the directory path
+    pdb_dir = "./data/casp15_monomers_without_T1137"
+    
+    # Get all PDB files in the directory
+    pdb_files = glob.glob(os.path.join(pdb_dir, "*.pdb"))
+    
+    if not pdb_files:
+        raise FileNotFoundError(f"No PDB files found in {pdb_dir}")
+    
+    # Initialize PDB parser
+    parser = PDBParser(QUIET=True)
+    
+    smallest_file = None
+    min_residues = float('inf')
+    
+    # Iterate through each PDB file and count residues
+    for pdb_file in pdb_files:
+        try:
+            # Get the structure ID from filename
+            structure_id = os.path.basename(pdb_file).split('.')[0]
+            
+            # Parse the structure
+            structure = parser.get_structure(structure_id, pdb_file)
+            
+            # Count residues (exclude water and hetero residues)
+            residue_count = sum(1 for residue in structure.get_residues() 
+                               if residue.id[0] == ' ')  # Standard residues have ' ' as hetflag
+            
+            print(f"File: {pdb_file}, Residue count: {residue_count}")
+            # Update if this is the smallest so far
+            if residue_count < min_residues:
+                min_residues = residue_count
+                smallest_file = pdb_file
+                
+        except Exception as e:
+            print(f"Error processing {pdb_file}: {e}")
+            continue
+    
+    if smallest_file is None:
+        raise ValueError("Could not determine the PDB file with fewest residues")
+    
+    print(f"PDB file with fewest residues: {smallest_file} ({min_residues} residues)")
+    
+    return smallest_file
