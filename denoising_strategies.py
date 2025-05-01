@@ -67,7 +67,7 @@ class PrintFormatter:
         if increase_indent:
             self.indent_level += 1
 
-class BaseDenoising(ABC):
+class BaseDenoisingStrategy(ABC):
     """Abstract base class for denoising strategies."""
     
     def __init__(self, client: ESM3InferenceClient):
@@ -218,7 +218,12 @@ class BaseDenoising(ABC):
         """Denoise a protein sequence using the specific strategy."""
         pass
 
-class EntropyBasedDenoising(BaseDenoising):
+    @abstractmethod
+    def _extract_strategy_params(self) -> dict:
+        """Extract parameters specific to the denoising strategy."""
+        pass
+
+class EntropyBasedDenoising(BaseDenoisingStrategy):
     """Denoising strategy that selects positions with lowest entropy."""
     
     def get_next_position(
@@ -342,7 +347,7 @@ class EntropyBasedDenoising(BaseDenoising):
         self.protein = decoded_protein
         return decoded_protein
 
-class MaxProbBasedDenoising(BaseDenoising):
+class MaxProbBasedDenoising(BaseDenoisingStrategy):
     """Denoising strategy that selects positions with highest probability for any token."""
     
     def get_next_position(
@@ -464,78 +469,3 @@ class MaxProbBasedDenoising(BaseDenoising):
         self.printer.print(f"Total model calls: {self.cost}", is_last=True, decrease_indent=True)
         return decoded_protein
 
-# Added test case
-if __name__ == "__main__":
-    # Create output directory if it doesn't exist
-    output_dir = "denoising_outputs"
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Create timestamped output file
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    output_file = os.path.join(output_dir, f"denoising_output_{timestamp}.txt")
-    
-    # Redirect output to both console and file
-    tee = Tee(output_file)
-    sys.stdout = tee
-    
-    try:
-        # --- Configuration ---
-        MODEL_NAME = "esm3_sm_8M_v1" # Or another available model
-        TEST_SEQUENCE = "ACDE"
-        NOISE_PERCENTAGE = 50.0 # Mask 50% initially (2 positions for length 4)
-        NUM_DECODING_STEPS = 2 # Number of steps to unmask
-        TEMPERATURE = 0.0
-        TRACK = "sequence"
-        # --- End Configuration ---
-
-        # Check for GPU
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        print(f"Using device: {device}\n")
-
-        # Load local ESM3 model
-        model = ESM3.from_pretrained()
-        model.to(device)
-        model.eval()
-
-        # Create a dummy protein
-        protein = ESMProtein(sequence=TEST_SEQUENCE)
-        print(f"Original Protein: {protein.sequence}\n")
-
-        # Instantiate Denoiser with local model
-        denoiser = EntropyBasedDenoising(model)
-        denoiser.track = TRACK # Set track for prints
-
-        # Run denoising
-        denoised_protein = denoiser.denoise(
-            protein=protein,
-            noise_percentage=NOISE_PERCENTAGE,
-            num_decoding_steps=NUM_DECODING_STEPS,
-            temperature=TEMPERATURE,
-            track=TRACK,
-            verbose=True
-        )
-
-        # Try MaxProbBasedDenoising
-        print("\n=== Testing MaxProbBasedDenoising ===")
-        max_prob_denoiser = MaxProbBasedDenoising(model)
-        max_prob_denoiser.track = TRACK
-
-        denoised_protein_maxprob = max_prob_denoiser.denoise(
-            protein=protein,
-            noise_percentage=NOISE_PERCENTAGE,
-            num_decoding_steps=NUM_DECODING_STEPS,
-            temperature=TEMPERATURE,
-            track=TRACK,
-            verbose=True
-        )
-        
-    except ImportError:
-        print("Error: Could not import ESM3 model.")
-        print("Please ensure you have the correct version of esm installed.")
-    except Exception as e:
-        print(f"An error occurred during the test run: {e}")
-    finally:
-        # Restore stdout and close the file
-        sys.stdout = tee.stdout
-        tee.close()
-        print(f"\nOutput has been saved to: {output_file}")

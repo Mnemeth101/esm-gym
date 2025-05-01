@@ -7,7 +7,17 @@ from esm.sdk.api import (
 )
 import torch.nn.functional as F
 import math  # Add import for math
-from typing import List
+from typing import List, Dict, Any, Optional, Tuple, Callable
+import time
+import os
+import sys
+from datetime import datetime
+from tqdm import tqdm
+import inspect
+import numpy as np
+
+
+from denoising_strategies import Tee, BaseDenoisingStrategy
 
 ### Single Metrics - metrics for a single protein
 def single_metric_UACCE(client: ESM3InferenceClient, protein: ESMProtein, verbose: bool = False) -> float:
@@ -532,3 +542,424 @@ def get_smallest_pdb_file():
     print(f"PDB file with fewest residues: {smallest_file} ({min_residues} residues)")
     
     return smallest_file
+
+class BenchmarkRunner:
+    """
+    Simplified class to benchmark denoising strategies by running them multiple times and collecting metrics.
+    
+    This version is more flexible and can work with any denoising strategy regardless of its specific parameters.
+    It captures individual metrics for each protein and aggregates them at the end.
+    """
+    
+    def __init__(
+        self, 
+        client,
+        num_runs=50,
+        verbose=False
+    ):
+        """
+        Initialize the benchmark runner.
+        
+        Args:
+            client: ESM3InferenceClient instance
+            num_runs: Number of runs (generated sequences) per strategy
+            verbose: Whether to print detailed information
+        """
+        self.client = client
+        self.num_runs = num_runs
+        self.verbose = verbose
+        self.results = {}
+    
+    def run_benchmark(self, strategy_instance: BaseDenoisingStrategy, source_protein: ESMProtein, strategy_name=None):
+        """
+        Run a benchmark for a specific denoising strategy.
+        
+        Args:
+            strategy_instance: Instance of a denoising strategy (must have denoise method and return_generation method)
+            source_protein: Source protein to denoise (ESMProtein)
+            strategy_name: Name for this strategy in results (defaults to class name)
+            
+        Returns:
+            dict: Benchmark results
+        """
+        if strategy_name is None:
+            strategy_name = strategy_instance.__class__.__name__
+            
+        print(f"\n{'=' * 80}\nRunning benchmark for: {strategy_name}\n{'=' * 80}")
+        
+        # Setup logging
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = f"denoising_outputs/denoising_output_{timestamp}.txt"
+        
+        # Ensure the directory exists
+        os.makedirs("denoising_outputs", exist_ok=True)
+        
+        # Create output file and backup stdout
+        original_stdout = sys.stdout
+        sys.stdout = Tee(log_file)
+        
+        # Extract strategy parameters for logging
+        strategy_params = strategy_instance._extract_strategy_params() # Require this from the Denoisers classes
+        
+        print(f"Benchmark started at {datetime.now()}")
+        print(f"Strategy: {strategy_name}")
+        print(f"Strategy parameters: {strategy_params}")
+        print(f"Source protein: {source_protein.sequence}")
+        print(f"Number of runs: {self.num_runs}")
+        
+        # Lists to collect results
+        generated_proteins = []
+        single_metrics = []  # Will contain dictionaries of metrics for each protein
+        costs = []
+        times = []
+        
+        try:
+            for run in tqdm(range(self.num_runs), desc=f"Benchmarking {strategy_name}"):
+                print(f"\n\n--- Run {run+1}/{self.num_runs} ---")
+                
+                # Reset the strategy instance if it has reset method
+                if hasattr(strategy_instance, 'reset') and callable(strategy_instance.reset):
+                    strategy_instance.reset()
+                
+                start_time = time.time()
+                
+                # Run the denoising strategy
+                try:
+                    generated_protein = strategy_instance.denoise(
+                        source_protein.copy(), 
+                        verbose=self.verbose
+                    )
+                    
+                    # Get the protein and cost from the strategy
+                    if hasattr(strategy_instance, 'return_generation'):
+                        protein_and_cost = strategy_instance.return_generation()
+                        generated_protein = protein_and_cost[0] if generated_protein is None else generated_protein
+                        cost = protein_and_cost[1] if len(protein_and_cost) > 1 else 0
+                    else:
+                        cost = getattr(strategy_instance, 'cost', 0)
+                    
+                    end_time = time.time()
+                    run_time = end_time - start_time
+                    
+                    # Collect metrics for this individual protein
+                    protein_metrics = self._collect_single_metrics(generated_protein)
+                    
+                    # Store results
+                    if generated_protein.sequence:
+                        generated_proteins.append(generated_protein)
+                        single_metrics.append(protein_metrics)
+                        times.append(run_time)
+                        costs.append(cost)
+                        
+                        print(f"Run {run+1} completed in {run_time:.2f}s with cost {cost}")
+                        print(f"Generated sequence: {generated_protein.sequence}")
+                        print(f"Single metrics: {protein_metrics}")
+                    else:
+                        print(f"Run {run+1} failed: no sequence generated")
+                        
+                except Exception as e:
+                    print(f"Error in run {run+1}: {e}")
+                    import traceback
+                    traceback.print_exc()
+                
+            # Calculate aggregated metrics
+            print("\n\n--- Benchmark Results ---")
+            
+            # Only calculate metrics if we have generated proteins
+            if generated_proteins:
+                sequences = [p.sequence for p in generated_proteins]
+                
+                # Calculate diversity using different methods
+                try:
+                    levenshtein_diversity = aggregated_metric_diversity(
+                        sequences, method="levenshtein", verbose=True
+                    )
+                    if all(len(p) == len(sequences[0]) for p in sequences):
+                        hamming_diversity = aggregated_metric_diversity(
+                            sequences, method="hamming", verbose=True
+                        )
+                        identity_diversity = aggregated_metric_diversity(
+                            sequences, method="identity", verbose=True
+                        )
+                    else:
+                        hamming_diversity = None
+                        identity_diversity = None
+                except Exception as e:
+                    print(f"Error calculating diversity metrics: {e}")
+                    levenshtein_diversity = None
+                    hamming_diversity = None
+                    identity_diversity = None
+                    
+                # Calculate entropy
+                try:
+                    global_entropy = aggregated_metric_entropy(
+                        sequences, position_specific=False, verbose=True
+                    )
+                    if all(len(p) == len(sequences[0]) for p in sequences):
+                        position_entropies = aggregated_metric_entropy(
+                            sequences, position_specific=True, verbose=True
+                        )
+                        avg_position_entropy = sum(position_entropies) / len(position_entropies) if position_entropies else None
+                    else:
+                        position_entropies = None
+                        avg_position_entropy = None
+                except Exception as e:
+                    print(f"Error calculating entropy metrics: {e}")
+                    global_entropy = None
+                    position_entropies = None
+                    avg_position_entropy = None
+                
+                # Calculate statistics
+                avg_cost = np.mean(costs) if costs else 0
+                std_cost = np.std(costs) if costs else 0
+                avg_time = np.mean(times) if times else 0
+                std_time = np.std(times) if times else 0
+                
+                # Average single metrics across all proteins
+                avg_single_metrics = self._average_single_metrics(single_metrics)
+                
+                # Compile results
+                results = {
+                    "strategy": strategy_name,
+                    "strategy_params": strategy_params,
+                    "num_runs": self.num_runs,
+                    "num_completed": len(generated_proteins),
+                    "avg_cost": avg_cost,
+                    "std_cost": std_cost,
+                    "avg_time": avg_time,
+                    "std_time": std_time,
+                    "entropy": {
+                        "global": global_entropy,
+                        "avg_position": avg_position_entropy
+                    },
+                    "diversity": {
+                        "levenshtein": levenshtein_diversity,
+                        "hamming": hamming_diversity,
+                        "identity": identity_diversity
+                    },
+                    "avg_single_metrics": avg_single_metrics,
+                    "single_metrics": single_metrics,  # Store all individual metrics
+                    "generated_proteins": generated_proteins,
+                    "costs": costs,
+                    "times": times
+                }
+                
+                # Print summary
+                print("\n--- Summary ---")
+                print(f"Strategy: {strategy_name}")
+                print(f"Strategy parameters: {strategy_params}")
+                print(f"Completed runs: {len(generated_proteins)}/{self.num_runs}")
+                print(f"Average cost: {avg_cost:.2f} ± {std_cost:.2f}")
+                print(f"Average time: {avg_time:.2f}s ± {std_time:.2f}s")
+                print(f"Global entropy: {global_entropy:.4f}" if global_entropy else "Global entropy: N/A")
+                print(f"Average position-specific entropy: {avg_position_entropy:.4f}" if avg_position_entropy else "Average position entropy: N/A")
+                print(f"Levenshtein diversity: {levenshtein_diversity:.4f}" if levenshtein_diversity else "Levenshtein diversity: N/A")
+                print(f"Average metrics across proteins:")
+                for metric, value in avg_single_metrics.items():
+                    print(f"  - {metric}: {value:.4f}")
+                
+                # Store results
+                self.results[strategy_name] = results
+                
+                return results
+                
+            else:
+                print("No proteins were successfully generated.")
+                return {
+                    "strategy": strategy_name,
+                    "strategy_params": strategy_params,
+                    "num_runs": self.num_runs,
+                    "num_completed": 0,
+                    "error": "No proteins were successfully generated."
+                }
+                
+        except Exception as e:
+            print(f"Benchmark failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            return {
+                "strategy": strategy_name,
+                "strategy_params": strategy_params,
+                "error": str(e),
+                "num_completed": len(generated_proteins),
+                "generated_proteins": generated_proteins,
+                "costs": costs,
+                "times": times
+            }
+            
+        finally:
+            # Restore stdout
+            sys.stdout = original_stdout
+            print(f"Benchmark for {strategy_name} completed. Log saved to {log_file}")
+    
+    def _collect_single_metrics(self, protein: ESMProtein) -> Dict[str, float]:
+        """
+        Collect all available single metrics for a generated protein.
+        
+        Args:
+            protein: Generated protein to evaluate
+            
+        Returns:
+            dict: Dictionary of metrics
+        """
+        metrics = {}
+        
+        # Try to compute each metric, skipping those that fail
+        if hasattr(protein, 'plddt') and protein.plddt is not None:
+            try:
+                metrics['avg_pLDDT'] = single_metric_average_pLDDT(protein)
+            except Exception as e:
+                print(f"Error calculating pLDDT: {e}")
+        
+        if hasattr(protein, 'ptm') and protein.ptm is not None:
+            try:
+                metrics['pTM'] = single_metric_pTM(protein)
+            except Exception as e:
+                print(f"Error calculating pTM: {e}")
+        
+        # Only try UACCE if we have a client
+        if hasattr(self, 'client') and self.client is not None:
+            try:
+                metrics['UACCE'] = single_metric_UACCE(self.client, protein)
+            except Exception as e:
+                print(f"Error calculating UACCE: {e}")
+        
+        return metrics
+    
+    def _average_single_metrics(self, metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
+        """
+        Average the single metrics across all proteins.
+        
+        Args:
+            metrics_list: List of metric dictionaries for each protein
+            
+        Returns:
+            dict: Dictionary of averaged metrics
+        """
+        if not metrics_list:
+            return {}
+            
+        # Collect all metrics by name
+        all_metrics = {}
+        for metrics in metrics_list:
+            for name, value in metrics.items():
+                if name not in all_metrics:
+                    all_metrics[name] = []
+                all_metrics[name].append(value)
+        
+        # Average each metric
+        avg_metrics = {}
+        for name, values in all_metrics.items():
+            try:
+                avg_metrics[name] = np.mean(values)
+            except Exception as e:
+                print(f"Error averaging metric {name}: {e}")
+                avg_metrics[name] = float('nan')
+                
+        return avg_metrics
+            
+def run_denoising_benchmarks(client, source_protein: ESMProtein, strategy_instances, **kwargs):
+    """
+    Run benchmarks for multiple denoising strategies.
+    
+    Args:
+        client: ESM3InferenceClient instance
+        source_protein: Source protein to denoise (ESMProtein)
+        strategy_instances: List of (strategy_instance, strategy_name) tuples
+        **kwargs: Additional arguments for BenchmarkRunner
+        
+    Returns:
+        tuple: (BenchmarkRunner instance, comparison results)
+    """
+    # Create benchmark runner
+    runner = BenchmarkRunner(client, **kwargs)
+    
+    # Run benchmarks for each strategy
+    for strategy, strategy_name in strategy_instances:
+        runner.run_benchmark(strategy, source_protein, strategy_name)
+        
+    # Compare results
+    comparison = runner.compare_strategies()
+    
+    return runner, comparison
+
+def save_benchmark_results(runner: BenchmarkRunner, output_file=None):
+    """
+    Save benchmark results to a file.
+    
+    Args:
+        runner: BenchmarkRunner instance with results
+        output_file: Output file path (default: generates timestamped filename)
+        
+    Returns:
+        str: Path to the saved file
+    """
+    import json
+    from datetime import datetime
+    
+    if output_file is None:
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_file = f"denoising_benchmark_results_{timestamp}.json"
+        
+    # Convert results to serializable format
+    serializable_results = {}
+    
+    for strategy_name, result in runner.results.items():
+        # Make a copy to avoid modifying the original
+        serialized_result = {}
+        
+        # Selectively copy fields that can be serialized
+        for key, value in result.items():
+            # Skip non-serializable objects
+            if key in ['generated_proteins', 'single_metrics']:
+                continue
+                
+            if key == 'avg_single_metrics':
+                # Convert any numpy values to regular Python types
+                serialized_result[key] = {
+                    metric: val.item() if hasattr(val, 'item') else val
+                    for metric, val in value.items()
+                }
+                continue
+                
+            # Handle numpy values
+            if hasattr(value, 'item'):
+                serialized_result[key] = value.item()
+            elif isinstance(value, dict):
+                # Handle nested dictionaries
+                serialized_result[key] = {}
+                for k, v in value.items():
+                    if hasattr(v, 'item'):
+                        serialized_result[key][k] = v.item()
+                    else:
+                        serialized_result[key][k] = v
+            elif isinstance(value, (list, np.ndarray)) and key in ["costs", "times"]:
+                # Convert costs and times to lists
+                serialized_result[key] = [x.item() if hasattr(x, 'item') else x for x in value]
+            else:
+                # Other simple types
+                serialized_result[key] = value
+                
+        # Record counts instead of full sequences
+        if 'generated_proteins' in result:
+            serialized_result['num_generated'] = len(result['generated_proteins'])
+                
+        serializable_results[strategy_name] = serialized_result
+        
+    # Save to file
+    with open(output_file, 'w') as f:
+        json.dump(
+            {
+                "timestamp": datetime.now().isoformat(),
+                "config": {
+                    "num_runs": runner.num_runs
+                },
+                "results": serializable_results
+            },
+            f,
+            indent=2
+        )
+        
+    print(f"Benchmark results saved to {output_file}")
+    return output_file

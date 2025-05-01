@@ -9,15 +9,15 @@ The goal of this repo is to set up metrics and strategies to evaluate how to opt
 
 
 ### Metrics
-1. Foldability: RMSD of (ESMFold predicted structure) --8x-->  ESM-IF designed sequence --> (ESMFolded Structure) - run the ESMFolds on GCP
-2. pLDDT (ESM3)
-4. pAE (ESM3)
-3. pTM (ESMFold)
-6. (Sequence) Entropy
-7. (Sequence) Diversity
-8. Computational cost of sampling
-9. Cosine similarity to ESM-C embedding of original sequence 
-10. ESM3 pseudo-log-likelihood of designed sequence
+1. Designability: RMSD of (ESMFold predicted structure) --8x-->  ESM-IF designed sequence --> (ESMFolded Structure) - run the ESMFolds on GCP ❌
+2. pLDDT (ESM3) ✅
+3. pTM (ESMFold) ✅
+4. Foldability: % structures generated from a single sequence that achieve (pLDDT > 80 & pTM > 0.7) ✅
+6. (Sequence) Entropy ✅
+7. (Sequence) Diversity ✅
+8. Computational cost of sampling ✅
+9. Cosine similarity to ESM-C embedding of original sequence ✅
+10. Unmask aggregated categorical cross entropy (instead of pseudo-likelihood which takes O(L) runs)) ✅
 11. (?) Difference in function track tokens/embedding
 
 ### Algorithmic Strategies ()
