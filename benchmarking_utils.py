@@ -15,6 +15,7 @@ from datetime import datetime
 from tqdm import tqdm
 import inspect
 import numpy as np
+import json
 
 
 from denoising_strategies import Tee, BaseDenoisingStrategy
@@ -691,7 +692,8 @@ class BenchmarkRunner:
         client,
         source_protein_path,
         num_runs=50,
-        verbose=False
+        verbose=False,
+        output_dir="data/benchmarking_results"
     ):
         """
         Initialize the benchmark runner.
@@ -701,17 +703,158 @@ class BenchmarkRunner:
             source_protein_path: Path to the source protein PDB file
             num_runs: Number of runs (generated sequences) per strategy
             verbose: Whether to print detailed information
+            output_dir: Base directory for benchmark results
         """
         self.client = client
         self.source_protein_path = source_protein_path
         self.num_runs = num_runs
         self.verbose = verbose
         self.results = {}
+        self.output_dir = output_dir
         # Load the source protein from the provided path
         self.source_protein = ESMProtein.from_pdb(source_protein_path)
         if self.verbose:
             print(f"Loaded source protein from {source_protein_path}")
             print(f"Source protein sequence length: {len(self.source_protein.sequence)}")
+    
+    def _create_job_folder(self, strategy_name):
+        """
+        Create a job folder for this benchmark run.
+        
+        Args:
+            strategy_name: Name of the strategy being benchmarked
+        
+        Returns:
+            tuple: (job_folder_path, log_file_path)
+        """
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        job_name = f"{strategy_name}_{timestamp}"
+        job_folder = os.path.join(self.output_dir, job_name)
+        
+        # Ensure the directory exists
+        os.makedirs(job_folder, exist_ok=True)
+        
+        # Create a log file path
+        log_file = os.path.join(job_folder, "denoising_output.txt")
+        
+        print(f"Created job folder: {job_folder}")
+        return job_folder, log_file
+    
+    def _save_sequences(self, job_folder, generated_proteins, strategy_name):
+        """
+        Save the generated sequences to a file.
+        
+        Args:
+            job_folder: Path to the job folder
+            generated_proteins: List of generated proteins
+            strategy_name: Name of the strategy
+            
+        Returns:
+            str: Path to the saved file
+        """
+        sequences_file = os.path.join(job_folder, "generated_sequences.txt")
+        with open(sequences_file, 'w') as f:
+            f.write(f"Generated sequences for {strategy_name}\n")
+            f.write(f"Total sequences: {len(generated_proteins)}\n\n")
+            
+            for i, protein in enumerate(generated_proteins):
+                f.write(f">Sequence_{i+1}\n")
+                f.write(f"{protein.sequence}\n\n")
+                
+                # Add additional protein metadata if available
+                if hasattr(protein, 'plddt') and protein.plddt is not None:
+                    f.write(f"Average pLDDT: {protein.plddt.mean():.4f}\n")
+                if hasattr(protein, 'ptm') and protein.ptm is not None:
+                    f.write(f"pTM: {protein.ptm:.4f}\n")
+                f.write("\n")
+                
+        print(f"Saved {len(generated_proteins)} sequences to {sequences_file}")
+        return sequences_file
+    
+    def _save_stats(self, job_folder, results, strategy_name):
+        """
+        Save the benchmark statistics to a file.
+        
+        Args:
+            job_folder: Path to the job folder
+            results: Benchmark results
+            strategy_name: Name of the strategy
+            
+        Returns:
+            str: Path to the saved file
+        """
+        stats_file = os.path.join(job_folder, "benchmark_stats.json")
+        
+        # Convert results to serializable format
+        serializable_results = {}
+        
+        # Make a copy to avoid modifying the original
+        serialized_result = {}
+        
+        # Selectively copy fields that can be serialized
+        for key, value in results.items():
+            # Skip non-serializable objects
+            if key in ['generated_proteins', 'single_metrics']:
+                continue
+                
+            if key == 'strategy_params':
+                # Create a copy of strategy params without the client
+                serialized_result[key] = {k: v for k, v in value.items() if k != 'client'}
+                continue
+                
+            if key == 'avg_single_metrics':
+                # Convert any numpy values to regular Python types
+                serialized_result[key] = {
+                    metric: val.item() if hasattr(val, 'item') else val
+                    for metric, val in value.items()
+                }
+                continue
+                
+            # Handle numpy values
+            if hasattr(value, 'item'):
+                serialized_result[key] = value.item()
+            elif isinstance(value, dict):
+                # Handle nested dictionaries
+                serialized_result[key] = {}
+                for k, v in value.items():
+                    if hasattr(v, 'item'):
+                        serialized_result[key][k] = v.item()
+                    else:
+                        serialized_result[key][k] = v
+            elif isinstance(value, (list, np.ndarray)) and key in ["costs", "times"]:
+                # Convert costs and times to lists
+                serialized_result[key] = [x.item() if hasattr(x, 'item') else x for x in value]
+            else:
+                # Other simple types
+                serialized_result[key] = value
+                
+        # Record counts instead of full sequences
+        if 'generated_proteins' in results:
+            serialized_result['num_generated'] = len(results['generated_proteins'])
+                
+        serializable_results[strategy_name] = serialized_result
+        
+        # Save to file
+        with open(stats_file, 'w') as f:
+            json.dump(
+                {
+                    "timestamp": datetime.now().isoformat(),
+                    "source_protein": {
+                        "path": self.source_protein_path,
+                        "sequence": self.source_protein.sequence,
+                        "length": len(self.source_protein.sequence)
+                    },
+                    "config": {
+                        "num_runs": self.num_runs
+                    },
+                    "results": serializable_results
+                },
+                f,
+                indent=2
+            )
+            
+        print(f"Saved benchmark stats to {stats_file}")
+        return stats_file
     
     def run_benchmark(self, strategy_instance: BaseDenoisingStrategy, strategy_name=None):
         """
@@ -729,12 +872,8 @@ class BenchmarkRunner:
             
         print(f"\n{'=' * 80}\nRunning benchmark for: {strategy_name}\n{'=' * 80}")
         
-        # Setup logging
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = f"denoising_outputs/denoising_output_{timestamp}.txt"
-        
-        # Ensure the directory exists
-        os.makedirs("denoising_outputs", exist_ok=True)
+        # Create job folder and log file
+        job_folder, log_file = self._create_job_folder(strategy_name)
         
         # Create output file and backup stdout
         original_stdout = sys.stdout
@@ -909,11 +1048,15 @@ class BenchmarkRunner:
                 # Store results
                 self.results[strategy_name] = results
                 
+                # Save sequences and stats to job folder
+                self._save_sequences(job_folder, generated_proteins, strategy_name)
+                self._save_stats(job_folder, results, strategy_name)
+                
                 return results
                 
             else:
                 print("No proteins were successfully generated.")
-                return {
+                results = {
                     "strategy": strategy_name,
                     "strategy_params": strategy_params,
                     "num_runs": self.num_runs,
@@ -921,64 +1064,36 @@ class BenchmarkRunner:
                     "error": "No proteins were successfully generated."
                 }
                 
+                # Save stats even if no proteins were generated
+                self._save_stats(job_folder, results, strategy_name)
+                return results
+                
         except Exception as e:
             print(f"Benchmark failed: {e}")
             import traceback
             traceback.print_exc()
             
-            return {
+            results = {
                 "strategy": strategy_name,
                 "strategy_params": strategy_params,
                 "error": str(e),
-                "num_completed": len(generated_proteins),
-                "generated_proteins": generated_proteins,
-                "costs": costs,
-                "times": times
+                "num_completed": len(generated_proteins) if 'generated_proteins' in locals() else 0
             }
+            
+            # Save stats even on error
+            if 'job_folder' in locals():
+                self._save_stats(job_folder, results, strategy_name)
+                
+                # Save sequences if we have any
+                if 'generated_proteins' in locals() and generated_proteins:
+                    self._save_sequences(job_folder, generated_proteins, strategy_name)
+            
+            return results
             
         finally:
             # Restore stdout
             sys.stdout = original_stdout
             print(f"Benchmark for {strategy_name} completed. Log saved to {log_file}")
-    
-    def _collect_single_metrics(self, protein: ESMProtein) -> Dict[str, float]:
-        """
-        Collect all available single metrics for a generated protein.
-        
-        Args:
-            protein: Generated protein to evaluate
-            
-        Returns:
-            dict: Dictionary of metrics
-        """
-        metrics = {}
-        
-        # Try to compute each metric, skipping those that fail
-        if hasattr(protein, 'plddt') and protein.plddt is not None:
-            try:
-                metrics['avg_pLDDT'] = single_metric_average_pLDDT(protein)
-            except Exception as e:
-                print(f"Error calculating pLDDT: {e}")
-        
-        if hasattr(protein, 'ptm') and protein.ptm is not None:
-            try:
-                metrics['pTM'] = single_metric_pTM(protein)
-            except Exception as e:
-                print(f"Error calculating pTM: {e}")
-        
-        # Only try UACCE and foldability if we have a client
-        if hasattr(self, 'client') and self.client is not None:
-            try:
-                metrics['UACCE'] = single_metric_UACCE(self.client, protein)
-            except Exception as e:
-                print(f"Error calculating UACCE: {e}")
-            try:
-                # Use a smaller number of samples for benchmarking to save time
-                metrics['foldability'] = single_metric_foldability(self.client, protein, num_samples=3, verbose=self.verbose)
-            except Exception as e:
-                print(f"Error calculating foldability: {e}")
-        
-        return metrics
     
     def run_benchmark_parallel(self, strategy_instance: BaseDenoisingStrategy, strategy_name=None, n_processes=None):
         """
@@ -1002,12 +1117,8 @@ class BenchmarkRunner:
             
         print(f"\n{'=' * 80}\nRunning parallel benchmark for: {strategy_name}\n{'=' * 80}")
         
-        # Setup logging
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        log_file = f"denoising_outputs/denoising_output_{timestamp}.txt"
-        
-        # Ensure the directory exists
-        os.makedirs("denoising_outputs", exist_ok=True)
+        # Create job folder and log file
+        job_folder, log_file = self._create_job_folder(strategy_name)
         
         # Determine number of processes
         if n_processes is None:
@@ -1016,8 +1127,9 @@ class BenchmarkRunner:
         
         print(f"Using {n_processes} parallel processes for {self.num_runs} runs")
         
-        # Extract strategy parameters for logging
+        # Extract strategy parameters for logging and add client
         strategy_params = strategy_instance._extract_strategy_params()
+        strategy_params['client'] = self.client  # Add client to parameters
         
         # Main file for final aggregated results
         with open(log_file, 'w') as main_log:
@@ -1205,6 +1317,10 @@ class BenchmarkRunner:
                 # Store results
                 self.results[strategy_name] = results
                 
+                # Save sequences and stats to job folder
+                self._save_sequences(job_folder, generated_proteins, strategy_name)
+                self._save_stats(job_folder, results, strategy_name)
+                
                 print(f"Parallel benchmark for {strategy_name} completed. Log saved to {log_file}")
                 return results
                 
@@ -1213,13 +1329,18 @@ class BenchmarkRunner:
                 with open(log_file, 'a') as main_log:
                     main_log.write("\n\nNo proteins were successfully generated.\n")
                     
-                return {
+                results = {
                     "strategy": strategy_name,
                     "strategy_params": strategy_params,
                     "num_runs": self.num_runs,
                     "num_completed": 0,
                     "error": "No proteins were successfully generated."
                 }
+                
+                # Save stats even if no proteins were generated
+                self._save_stats(job_folder, results, strategy_name)
+                
+                return results
                 
         except Exception as e:
             print(f"Parallel benchmark failed: {e}")
@@ -1230,12 +1351,17 @@ class BenchmarkRunner:
                 main_log.write(f"\n\nParallel benchmark failed: {e}\n")
                 main_log.write(traceback.format_exc())
             
-            return {
+            results = {
                 "strategy": strategy_name,
                 "strategy_params": strategy_params,
                 "error": str(e),
                 "num_completed": len(generated_proteins) if 'generated_proteins' in locals() else 0
             }
+            
+            # Save stats even on error
+            self._save_stats(job_folder, results, strategy_name)
+            
+            return results
     
     def _average_single_metrics(self, metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
         """
@@ -1297,6 +1423,9 @@ def run_denoising_benchmarks(client, source_protein_path, strategy_instances, **
 def save_benchmark_results(runner: BenchmarkRunner, output_file=None):
     """
     Save benchmark results to a file.
+    
+    Note: This function is maintained for backward compatibility.
+    BenchmarkRunner now automatically saves results to the job folder.
     
     Args:
         runner: BenchmarkRunner instance with results
@@ -1372,4 +1501,4 @@ def save_benchmark_results(runner: BenchmarkRunner, output_file=None):
         )
         
     print(f"Benchmark results saved to {output_file}")
-    return output_file
+    return output_file 

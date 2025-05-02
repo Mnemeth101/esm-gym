@@ -230,6 +230,20 @@ class BaseDenoisingStrategy(ABC):
 class EntropyBasedDenoising(BaseDenoisingStrategy):
     """Denoising strategy that selects positions with lowest entropy."""
     
+    def __init__(
+        self,
+        client: ESM3InferenceClient,
+        noise_percentage: float = 50.0,
+        num_decoding_steps: int = 20,
+        temperature: float = 0.0,
+    ):
+        super().__init__(
+            client=client,
+            noise_percentage=noise_percentage,
+            num_decoding_steps=num_decoding_steps,
+            temperature=temperature
+        )
+    
     def get_next_positions(
         self,
         protein_tensor: ESMProteinTensor,

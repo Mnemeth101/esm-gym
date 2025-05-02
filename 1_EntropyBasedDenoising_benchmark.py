@@ -23,13 +23,11 @@ denoising_strategy = EntropyBasedDenoising(
 # The runner will load the protein for us
 runner = BenchmarkRunner(client=model, source_protein_path=pdb_file, num_runs=50, verbose=True)
 
-# Run the benchmark - just pass the strategy, source protein is already loaded
-results = runner.run_benchmark(denoising_strategy, strategy_name="EntropyBasedDenoising")
-# results = runner.run_benchmark_parallel(denoising_strategy, strategy_name="EntropyBasedDenoising")
+if __name__ == '__main__':
+    # Run the benchmark - just pass the strategy, source protein is already loaded
+    # results = runner.run_benchmark(denoising_strategy, strategy_name="EntropyBasedDenoising")
+    # Uncomment to use the parallel version:
+    results = runner.run_benchmark_parallel(denoising_strategy, strategy_name="EntropyBasedDenoising", n_processes=8)
 
-# Save the results
-output_file = "data/benchmarking_results/entropy_based_denoising_results.json"
-os.makedirs(os.path.dirname(output_file), exist_ok=True)
-save_benchmark_results(runner, output_file=output_file)
-
-print(f"Benchmark results saved to {output_file}")
+    # No need to manually save results anymore - they're automatically saved in the job folder
+    print(f"Benchmark complete - results saved in data/benchmarking_results/EntropyBasedDenoising_*")
