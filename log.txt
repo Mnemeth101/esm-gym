@@ -2,4 +2,11 @@ April 14, 2025
 * working through setting up the baseline generation strategies and skeleton code
 * confirmed that the entropy that we get from forward_and_sample is the probabilities (_softmaxed_ logits) and not the logits themselves. So I don't have to mess around with client.logits()
 [x] working on implementing EntropyBased and MaxProbBased decoding for naked sequences - without structure input
-[] implement structure input
+[x] implement structure input
+
+May 1, 2025
+- finished metrics
+- finished benchmarking suite
+[🟡] running EntropyBased benchmarking on T1123-D1, 50 runs. Okay not T1123-D1, marked as sequence of concern >:(   Doing 1121-D2
+[] MaxProb
+[] design, test simulated annealing method (looks like they may have implemented closed source?)

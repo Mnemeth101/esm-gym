@@ -210,7 +210,7 @@ def single_metric_foldability(client: ESM3InferenceClient, protein: ESMProtein, 
                 print(f"  pLDDT: {plddt:.2f}, pTM: {ptm:.2f}")
                 
             # Check if this sample meets all criteria
-            if plddt > 80 and ptm > 0.7:
+            if plddt > .80 and ptm > 0.7:
                 successful_count += 1
                 if verbose:
                     print("  ✓ Sample meets foldability criteria")
@@ -543,6 +543,141 @@ def get_smallest_pdb_file():
     
     return smallest_file
 
+# Define a worker function that will be used by run_benchmark_parallel
+# This needs to be at module level to be picklable
+def _parallel_benchmark_worker(args):
+    """
+    Worker function for parallel benchmarking.
+    
+    Args:
+        args: Tuple of (run_id, strategy_params, source_protein, strategy_class_name, verbose)
+        
+    Returns:
+        dict: Results for this run
+    """
+    import time
+    import io
+    import copy
+    import importlib
+    
+    run_id, strategy_params, source_protein, strategy_class_name, verbose = args
+    
+    # Create a copy of the strategy for this worker
+    # We need to dynamically import the strategy class from the denoising_strategies module
+    try:
+        denoising_module = importlib.import_module('denoising_strategies')
+        strategy_class = getattr(denoising_module, strategy_class_name)
+        worker_strategy = strategy_class(**strategy_params)
+    except Exception as e:
+        return {
+            "run_id": run_id,
+            "success": False,
+            "error": f"Failed to create strategy: {str(e)}",
+            "time": 0,
+            "log": f"Error creating strategy: {str(e)}\n"
+        }
+    
+    # Capture output for this worker in a string buffer
+    worker_output = io.StringIO()
+    worker_output.write(f"--- Run {run_id+1} ---\n")
+    
+    # Initialize result data
+    result = {
+        "run_id": run_id,
+        "success": False,
+        "protein": None,
+        "metrics": {},
+        "cost": 0,
+        "time": 0,
+        "error": None,
+        "log": ""
+    }
+    
+    start_time = time.time()
+    
+    try:
+        # Reset the strategy instance if it has reset method
+        if hasattr(worker_strategy, 'reset') and callable(worker_strategy.reset):
+            worker_strategy.reset()
+        
+        # Run the denoising strategy
+        generated_protein = worker_strategy.denoise(
+            source_protein.copy(),
+            verbose=False  # Less verbose in parallel mode
+        )
+        
+        # Get the protein and cost from the strategy
+        if hasattr(worker_strategy, 'return_generation'):
+            protein_and_cost = worker_strategy.return_generation()
+            generated_protein = protein_and_cost[0] if generated_protein is None else generated_protein
+            cost = protein_and_cost[1] if len(protein_and_cost) > 1 else 0
+        else:
+            cost = getattr(worker_strategy, 'cost', 0)
+        
+        end_time = time.time()
+        run_time = end_time - start_time
+        
+        # Check if we got a valid protein
+        if generated_protein is not None and generated_protein.sequence:
+            # Store important protein attributes in a serializable format
+            protein_data = {
+                "sequence": generated_protein.sequence,
+            }
+            
+            # Add structure if available (simplified)
+            if hasattr(generated_protein, 'structure') and generated_protein.structure is not None:
+                protein_data["has_structure"] = True
+            
+            # Add pLDDT and pTM if available
+            if hasattr(generated_protein, 'plddt') and generated_protein.plddt is not None:
+                protein_data["plddt"] = generated_protein.plddt.tolist()
+            if hasattr(generated_protein, 'ptm') and generated_protein.ptm is not None:
+                protein_data["ptm"] = float(generated_protein.ptm)
+            
+            # Collect metrics but don't compute UACCE or foldability in workers
+            worker_metrics = {}
+            if hasattr(generated_protein, 'plddt') and generated_protein.plddt is not None:
+                try:
+                    from benchmarking_utils import single_metric_average_pLDDT
+                    worker_metrics['avg_pLDDT'] = single_metric_average_pLDDT(generated_protein)
+                except Exception as e:
+                    worker_output.write(f"Error calculating pLDDT: {e}\n")
+            
+            if hasattr(generated_protein, 'ptm') and generated_protein.ptm is not None:
+                try:
+                    from benchmarking_utils import single_metric_pTM
+                    worker_metrics['pTM'] = single_metric_pTM(generated_protein)
+                except Exception as e:
+                    worker_output.write(f"Error calculating pTM: {e}\n")
+            
+            result["success"] = True
+            result["protein_data"] = protein_data
+            result["generated_protein"] = generated_protein  # Keep the full protein object for post-processing
+            result["metrics"] = worker_metrics
+            result["cost"] = cost
+            result["time"] = run_time
+            
+            worker_output.write(f"Run {run_id+1} completed in {run_time:.2f}s with cost {cost}\n")
+            worker_output.write(f"Generated sequence: {generated_protein.sequence}\n")
+            worker_output.write(f"Metrics: {worker_metrics}\n")
+        else:
+            result["error"] = "No sequence generated"
+            worker_output.write(f"Run {run_id+1} failed: no sequence generated\n")
+    
+    except Exception as e:
+        import traceback
+        error_msg = traceback.format_exc()
+        worker_output.write(f"Error in run {run_id+1}: {e}\n")
+        worker_output.write(error_msg + "\n")
+        result["error"] = str(e)
+        result["time"] = time.time() - start_time
+    
+    # Save the captured output
+    result["log"] = worker_output.getvalue()
+    worker_output.close()
+    
+    return result
+
 class BenchmarkRunner:
     """
     Simplified class to benchmark denoising strategies by running them multiple times and collecting metrics.
@@ -554,6 +689,7 @@ class BenchmarkRunner:
     def __init__(
         self, 
         client,
+        source_protein_path,
         num_runs=50,
         verbose=False
     ):
@@ -562,21 +698,27 @@ class BenchmarkRunner:
         
         Args:
             client: ESM3InferenceClient instance
+            source_protein_path: Path to the source protein PDB file
             num_runs: Number of runs (generated sequences) per strategy
             verbose: Whether to print detailed information
         """
         self.client = client
+        self.source_protein_path = source_protein_path
         self.num_runs = num_runs
         self.verbose = verbose
         self.results = {}
+        # Load the source protein from the provided path
+        self.source_protein = ESMProtein.from_pdb(source_protein_path)
+        if self.verbose:
+            print(f"Loaded source protein from {source_protein_path}")
+            print(f"Source protein sequence length: {len(self.source_protein.sequence)}")
     
-    def run_benchmark(self, strategy_instance: BaseDenoisingStrategy, source_protein: ESMProtein, strategy_name=None):
+    def run_benchmark(self, strategy_instance: BaseDenoisingStrategy, strategy_name=None):
         """
         Run a benchmark for a specific denoising strategy.
         
         Args:
             strategy_instance: Instance of a denoising strategy (must have denoise method and return_generation method)
-            source_protein: Source protein to denoise (ESMProtein)
             strategy_name: Name for this strategy in results (defaults to class name)
             
         Returns:
@@ -604,7 +746,7 @@ class BenchmarkRunner:
         print(f"Benchmark started at {datetime.now()}")
         print(f"Strategy: {strategy_name}")
         print(f"Strategy parameters: {strategy_params}")
-        print(f"Source protein: {source_protein.sequence}")
+        print(f"Source protein: {self.source_protein.sequence}")
         print(f"Number of runs: {self.num_runs}")
         
         # Lists to collect results
@@ -626,7 +768,7 @@ class BenchmarkRunner:
                 # Run the denoising strategy
                 try:
                     generated_protein = strategy_instance.denoise(
-                        source_protein.copy(), 
+                        self.source_protein.copy(), 
                         verbose=self.verbose
                     )
                     
@@ -744,6 +886,12 @@ class BenchmarkRunner:
                     "times": times
                 }
                 
+                # Add the source protein name or path to the results
+                source_protein_name = getattr(self.source_protein, "name", None)
+                if not source_protein_name:
+                    source_protein_name = self.source_protein_path or "unknown_protein"
+                results["source_protein_name"] = source_protein_name
+                
                 # Print summary
                 print("\n--- Summary ---")
                 print(f"Strategy: {strategy_name}")
@@ -818,14 +966,276 @@ class BenchmarkRunner:
             except Exception as e:
                 print(f"Error calculating pTM: {e}")
         
-        # Only try UACCE if we have a client
+        # Only try UACCE and foldability if we have a client
         if hasattr(self, 'client') and self.client is not None:
             try:
                 metrics['UACCE'] = single_metric_UACCE(self.client, protein)
             except Exception as e:
                 print(f"Error calculating UACCE: {e}")
+            try:
+                # Use a smaller number of samples for benchmarking to save time
+                metrics['foldability'] = single_metric_foldability(self.client, protein, num_samples=3, verbose=self.verbose)
+            except Exception as e:
+                print(f"Error calculating foldability: {e}")
         
         return metrics
+    
+    def run_benchmark_parallel(self, strategy_instance: BaseDenoisingStrategy, strategy_name=None, n_processes=None):
+        """
+        Run a benchmark for a specific denoising strategy using parallel processing.
+        
+        Args:
+            strategy_instance: Instance of a denoising strategy (must have denoise method and return_generation method)
+            strategy_name: Name for this strategy in results (defaults to class name)
+            n_processes: Number of processes to use (defaults to number of CPU cores)
+            
+        Returns:
+            dict: Benchmark results
+        """
+        import multiprocessing as mp
+        from multiprocessing import Pool
+        import copy
+        from functools import partial
+        
+        if strategy_name is None:
+            strategy_name = strategy_instance.__class__.__name__
+            
+        print(f"\n{'=' * 80}\nRunning parallel benchmark for: {strategy_name}\n{'=' * 80}")
+        
+        # Setup logging
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+        log_file = f"denoising_outputs/denoising_output_{timestamp}.txt"
+        
+        # Ensure the directory exists
+        os.makedirs("denoising_outputs", exist_ok=True)
+        
+        # Determine number of processes
+        if n_processes is None:
+            n_processes = mp.cpu_count()
+        n_processes = min(n_processes, self.num_runs)  # Don't use more processes than runs
+        
+        print(f"Using {n_processes} parallel processes for {self.num_runs} runs")
+        
+        # Extract strategy parameters for logging
+        strategy_params = strategy_instance._extract_strategy_params()
+        
+        # Main file for final aggregated results
+        with open(log_file, 'w') as main_log:
+            main_log.write(f"Parallel benchmark started at {datetime.now()}\n")
+            main_log.write(f"Strategy: {strategy_name}\n")
+            main_log.write(f"Strategy parameters: {strategy_params}\n")
+            main_log.write(f"Source protein: {self.source_protein.sequence}\n")
+            main_log.write(f"Number of runs: {self.num_runs}\n")
+            main_log.write(f"Number of processes: {n_processes}\n\n")
+        
+        # Create arguments for each worker process
+        worker_args = []
+        for run_id in range(self.num_runs):
+            # Only pass serializable data to the worker
+            worker_args.append((
+                run_id,
+                strategy_params,
+                self.source_protein,
+                strategy_instance.__class__.__name__,
+                self.verbose
+            ))
+        
+        # Execute the worker function in parallel
+        try:
+            # Create pool and run tasks
+            with Pool(processes=n_processes) as pool:
+                # Use imap_unordered to get results as they complete
+                all_results = list(tqdm(
+                    pool.imap_unordered(_parallel_benchmark_worker, worker_args),
+                    total=self.num_runs,
+                    desc=f"Parallel benchmark for {strategy_name}"
+                ))
+            
+            # Process and aggregate results
+            generated_proteins = []
+            single_metrics = []
+            costs = []
+            times = []
+            
+            # First, write all logs in order of run_id
+            with open(log_file, 'a') as main_log:
+                # Sort results by run_id for ordered logging
+                sorted_results = sorted(all_results, key=lambda x: x["run_id"])
+                for result in sorted_results:
+                    main_log.write(f"\n{result['log']}\n")
+                    
+                    # Collect successful runs
+                    if result["success"]:
+                        # Here we're dealing with reconstructed proteins that might not have all methods
+                        # so we'll just collect what we have
+                        if "generated_protein" in result:
+                            generated_proteins.append(result["generated_protein"])
+                            single_metrics.append(result["metrics"])
+                        costs.append(result["cost"])
+                        times.append(result["time"])
+            
+            # Calculate metrics that require the original client
+            # First, calculate individual protein metrics that couldn't be done in workers
+            print(f"Calculating additional metrics for {len(generated_proteins)} proteins...")
+            for i, protein in enumerate(generated_proteins):
+                if hasattr(self, 'client') and self.client is not None:
+                    try:
+                        # Add UACCE and possibly other metrics requiring the client
+                        single_metrics[i]['UACCE'] = single_metric_UACCE(self.client, protein, verbose=False)
+                    except Exception as e:
+                        print(f"Error calculating UACCE for protein {i}: {e}")
+            
+            # Now calculate aggregated metrics if we have generated proteins
+            if generated_proteins:
+                sequences = [p.sequence for p in generated_proteins]
+                
+                # Calculate diversity using different methods
+                try:
+                    levenshtein_diversity = aggregated_metric_diversity(
+                        sequences, method="levenshtein", verbose=True
+                    )
+                    if all(len(p) == len(sequences[0]) for p in sequences):
+                        hamming_diversity = aggregated_metric_diversity(
+                            sequences, method="hamming", verbose=True
+                        )
+                        identity_diversity = aggregated_metric_diversity(
+                            sequences, method="identity", verbose=True
+                        )
+                    else:
+                        hamming_diversity = None
+                        identity_diversity = None
+                except Exception as e:
+                    print(f"Error calculating diversity metrics: {e}")
+                    levenshtein_diversity = None
+                    hamming_diversity = None
+                    identity_diversity = None
+                    
+                # Calculate entropy
+                try:
+                    global_entropy = aggregated_metric_entropy(
+                        sequences, position_specific=False, verbose=True
+                    )
+                    if all(len(p) == len(sequences[0]) for p in sequences):
+                        position_entropies = aggregated_metric_entropy(
+                            sequences, position_specific=True, verbose=True
+                        )
+                        avg_position_entropy = sum(position_entropies) / len(position_entropies) if position_entropies else None
+                    else:
+                        position_entropies = None
+                        avg_position_entropy = None
+                except Exception as e:
+                    print(f"Error calculating entropy metrics: {e}")
+                    global_entropy = None
+                    position_entropies = None
+                    avg_position_entropy = None
+                
+                # Calculate statistics
+                avg_cost = np.mean(costs) if costs else 0
+                std_cost = np.std(costs) if costs else 0
+                avg_time = np.mean(times) if times else 0
+                std_time = np.std(times) if times else 0
+                
+                # Average single metrics across all proteins
+                avg_single_metrics = self._average_single_metrics(single_metrics)
+                
+                # Compile results
+                results = {
+                    "strategy": strategy_name,
+                    "strategy_params": strategy_params,
+                    "num_runs": self.num_runs,
+                    "num_completed": len(generated_proteins),
+                    "avg_cost": avg_cost,
+                    "std_cost": std_cost,
+                    "avg_time": avg_time,
+                    "std_time": std_time,
+                    "entropy": {
+                        "global": global_entropy,
+                        "avg_position": avg_position_entropy
+                    },
+                    "diversity": {
+                        "levenshtein": levenshtein_diversity,
+                        "hamming": hamming_diversity,
+                        "identity": identity_diversity
+                    },
+                    "avg_single_metrics": avg_single_metrics,
+                    "single_metrics": single_metrics,  # Store all individual metrics
+                    "generated_proteins": generated_proteins,
+                    "costs": costs,
+                    "times": times
+                }
+                
+                # Add the source protein name or path to the results
+                source_protein_name = getattr(self.source_protein, "name", None)
+                if not source_protein_name:
+                    source_protein_name = self.source_protein_path or "unknown_protein"
+                results["source_protein_name"] = source_protein_name
+                
+                # Print summary
+                print("\n--- Summary ---")
+                print(f"Strategy: {strategy_name}")
+                print(f"Strategy parameters: {strategy_params}")
+                print(f"Completed runs: {len(generated_proteins)}/{self.num_runs}")
+                print(f"Average cost: {avg_cost:.2f} ± {std_cost:.2f}")
+                print(f"Average time: {avg_time:.2f}s ± {std_time:.2f}s")
+                print(f"Global entropy: {global_entropy:.4f}" if global_entropy else "Global entropy: N/A")
+                print(f"Average position-specific entropy: {avg_position_entropy:.4f}" if avg_position_entropy else "Average position entropy: N/A")
+                print(f"Levenshtein diversity: {levenshtein_diversity:.4f}" if levenshtein_diversity else "Levenshtein diversity: N/A")
+                print(f"Average metrics across proteins:")
+                for metric, value in avg_single_metrics.items():
+                    print(f"  - {metric}: {value:.4f}")
+                
+                # Write summary to log file as well
+                with open(log_file, 'a') as main_log:
+                    main_log.write("\n\n--- Summary ---\n")
+                    main_log.write(f"Strategy: {strategy_name}\n")
+                    main_log.write(f"Strategy parameters: {strategy_params}\n")
+                    main_log.write(f"Completed runs: {len(generated_proteins)}/{self.num_runs}\n")
+                    main_log.write(f"Average cost: {avg_cost:.2f} ± {std_cost:.2f}\n")
+                    main_log.write(f"Average time: {avg_time:.2f}s ± {std_time:.2f}s\n")
+                    if global_entropy:
+                        main_log.write(f"Global entropy: {global_entropy:.4f}\n")
+                    if avg_position_entropy:
+                        main_log.write(f"Average position-specific entropy: {avg_position_entropy:.4f}\n")
+                    if levenshtein_diversity:
+                        main_log.write(f"Levenshtein diversity: {levenshtein_diversity:.4f}\n")
+                    main_log.write(f"Average metrics across proteins:\n")
+                    for metric, value in avg_single_metrics.items():
+                        main_log.write(f"  - {metric}: {value:.4f}\n")
+                
+                # Store results
+                self.results[strategy_name] = results
+                
+                print(f"Parallel benchmark for {strategy_name} completed. Log saved to {log_file}")
+                return results
+                
+            else:
+                print("No proteins were successfully generated.")
+                with open(log_file, 'a') as main_log:
+                    main_log.write("\n\nNo proteins were successfully generated.\n")
+                    
+                return {
+                    "strategy": strategy_name,
+                    "strategy_params": strategy_params,
+                    "num_runs": self.num_runs,
+                    "num_completed": 0,
+                    "error": "No proteins were successfully generated."
+                }
+                
+        except Exception as e:
+            print(f"Parallel benchmark failed: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            with open(log_file, 'a') as main_log:
+                main_log.write(f"\n\nParallel benchmark failed: {e}\n")
+                main_log.write(traceback.format_exc())
+            
+            return {
+                "strategy": strategy_name,
+                "strategy_params": strategy_params,
+                "error": str(e),
+                "num_completed": len(generated_proteins) if 'generated_proteins' in locals() else 0
+            }
     
     def _average_single_metrics(self, metrics_list: List[Dict[str, float]]) -> Dict[str, float]:
         """
@@ -859,25 +1269,25 @@ class BenchmarkRunner:
                 
         return avg_metrics
             
-def run_denoising_benchmarks(client, source_protein: ESMProtein, strategy_instances, **kwargs):
+def run_denoising_benchmarks(client, source_protein_path, strategy_instances, **kwargs):
     """
     Run benchmarks for multiple denoising strategies.
     
     Args:
         client: ESM3InferenceClient instance
-        source_protein: Source protein to denoise (ESMProtein)
+        source_protein_path: Path to the source protein PDB file
         strategy_instances: List of (strategy_instance, strategy_name) tuples
         **kwargs: Additional arguments for BenchmarkRunner
         
     Returns:
         tuple: (BenchmarkRunner instance, comparison results)
     """
-    # Create benchmark runner
-    runner = BenchmarkRunner(client, **kwargs)
+    # Create benchmark runner with source protein path
+    runner = BenchmarkRunner(client, source_protein_path=source_protein_path, **kwargs)
     
     # Run benchmarks for each strategy
     for strategy, strategy_name in strategy_instances:
-        runner.run_benchmark(strategy, source_protein, strategy_name)
+        runner.run_benchmark(strategy, strategy_name)
         
     # Compare results
     comparison = runner.compare_strategies()

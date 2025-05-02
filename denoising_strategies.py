@@ -19,13 +19,10 @@ from esm.sdk.api import (
     LogitsConfig,
 )
 from esm.models.esm3 import ESM3
-from esm.tokenization import get_esm3_model_tokenizers
 from esm.sdk.forge import ESM3ForgeInferenceClient
 
-# Ensure TOKENIZERS_PATH environment variable is set or adjust path as needed
-# Assuming default installation location for tokenizers relative to esm package
-default_tokenizers_path = os.path.join(os.path.dirname(__file__), "..", "tokenizers")
-os.environ["TOKENIZERS_PATH"] = os.environ.get("TOKENIZERS_PATH", default_tokenizers_path)
+# Hardcoded token IDs
+MASK_TOKEN_ID = 32  # Mask token ID for sequence
 
 # Add a function to print to both console and file
 class Tee:
@@ -74,22 +71,11 @@ class BaseDenoisingStrategy(ABC):
         self, 
         client: ESM3InferenceClient,
         noise_percentage: float = 50.0,
-        num_decoding_steps: int = 20,  # Changed default to 20
+        num_decoding_steps: int = 20,
         temperature: float = 0.0,
-        track: str = "sequence"
     ):
-        if isinstance(client, ESM3):
-            self.tokenizers = client.tokenizers
-        elif isinstance(client, ESM3ForgeInferenceClient):
-            self.tokenizers = get_esm3_model_tokenizers(client.model)
-        else:
-            raise ValueError(
-                "client must be an instance of ESM3 or ESM3ForgeInferenceClient"
-            )
-
         self.client = client
-        self.track = track  # Default track
-        self.printer = PrintFormatter()  # Add printer
+        self.printer = PrintFormatter()
         self.cost = 0  # Number of calls to the model
         self.protein = None  # Placeholder for the protein object
         
@@ -101,18 +87,15 @@ class BaseDenoisingStrategy(ABC):
     def add_noise(
         self,
         protein_tensor: ESMProteinTensor,
-        noise_percentage: float,
-        track: str = "sequence"
+        noise_percentage: float
     ) -> ESMProteinTensor:
-        """Add noise by masking random positions."""
-        track_tensor = getattr(protein_tensor, track)
-        track_tokenizer = getattr(self.tokenizers, track)
-        
+        """Add noise by masking random positions in the sequence."""
         self.printer.print("Adding noise to protein tensor", increase_indent=True)
         
         # Calculate number of positions to mask
-        num_positions = len(track_tensor)
-        valid_positions = list(range(1, num_positions - 1))
+        sequence_tensor = protein_tensor.sequence
+        num_positions = len(sequence_tensor)
+        valid_positions = list(range(1, num_positions - 1))  # Skip start and end tokens
         num_to_mask = int(len(valid_positions) * (noise_percentage / 100))
         
         # Randomly select positions to mask
@@ -121,37 +104,21 @@ class BaseDenoisingStrategy(ABC):
         
         # Create new tensor with masked positions
         protein_tensor = attr.evolve(protein_tensor)
-        track_tensor = track_tensor.clone()
-        track_tensor[mask_positions] = track_tokenizer.mask_token_id
-        setattr(protein_tensor, track, track_tensor)
+        sequence_tensor = sequence_tensor.clone()
+        sequence_tensor[mask_positions] = MASK_TOKEN_ID
+        protein_tensor.sequence = sequence_tensor
         
-        self.printer.print(f"Masked positions ({track}): {mask_positions}")
-        self.printer.print(f"Resulting tensor: {getattr(protein_tensor, track)}", 
+        self.printer.print(f"Masked positions: {mask_positions}")
+        self.printer.print(f"Resulting tensor: {protein_tensor.sequence}", 
                           is_last=True, decrease_indent=True)
         return protein_tensor
     
-    def maybe_add_default_structure_tokens(
-        self, protein_tensor: ESMProteinTensor
-    ) -> ESMProteinTensor:
-        """Add default structure tokens if needed."""
-        empty_protein_tensor = ESMProteinTensor.empty(
-            len(protein_tensor) - 2,
-            tokenizers=self.tokenizers,
-            device=protein_tensor.device,
-        )
-        if protein_tensor.structure is None:
-            setattr(protein_tensor, "structure", empty_protein_tensor.structure)
-        else:
-            print("Warning: structure already exists in protein_tensor")
-        return protein_tensor
-
     def get_number_of_masked_positions(
-        self, protein_tensor: ESMProteinTensor, track: str = "sequence"
+        self, protein_tensor: ESMProteinTensor
     ) -> int:
         """Get number of masked positions, excluding start and end tokens."""
-        track_tensor = getattr(protein_tensor, track)
-        track_tokenizer = getattr(self.tokenizers, track)
-        is_mask = track_tensor == track_tokenizer.mask_token_id
+        sequence_tensor = protein_tensor.sequence
+        is_mask = sequence_tensor == MASK_TOKEN_ID
         return is_mask[1:-1].sum().item()
     
     def unmask_positions(
@@ -159,21 +126,19 @@ class BaseDenoisingStrategy(ABC):
         protein_tensor: ESMProteinTensor,
         positions: list,
         temperature: float,
-        track: str = "sequence",
         model_output = None
     ) -> ESMProteinTensor:
         """Unmask multiple specific positions using the model's prediction."""
         self.printer.print(f"Unmasking positions {positions}", increase_indent=True)
         
-        track_tensor = getattr(protein_tensor, track)
-        track_tokenizer = getattr(self.tokenizers, track)
-        
+        sequence_tensor = protein_tensor.sequence
         protein_tensor = attr.evolve(protein_tensor)
-        track_tensor = track_tensor.clone()
+        sequence_tensor = sequence_tensor.clone()
         
         if model_output is None:
-            sampling_config = SamplingConfig()
-            setattr(sampling_config, track, SamplingTrackConfig(temperature=temperature))
+            sampling_config = SamplingConfig(
+                sequence=SamplingTrackConfig(temperature=temperature)
+            )
             
             output = self.client.forward_and_sample(
                 protein_tensor,
@@ -184,16 +149,16 @@ class BaseDenoisingStrategy(ABC):
         else:
             output = model_output
         
-        output_track_tensor = getattr(output.protein_tensor, track)
+        output_sequence_tensor = output.protein_tensor.sequence
         
         for position in positions:
-            predicted_token_id = int(output_track_tensor[position].item())
-            predicted_token = getattr(self.tokenizers, self.track).decode(torch.tensor([predicted_token_id]))
+            predicted_token_id = int(output_sequence_tensor[position].item())
+            # We no longer decode tokens to text since we removed tokenizer dependency
             
-            track_tensor[position] = output_track_tensor[position]
-            self.printer.print(f"Position {position} - Predicted token: {predicted_token} ({predicted_token_id})")
+            sequence_tensor[position] = output_sequence_tensor[position]
+            self.printer.print(f"Position {position} - Predicted token ID: {predicted_token_id}")
         
-        setattr(protein_tensor, track, track_tensor)
+        protein_tensor.sequence = sequence_tensor
         self.printer.print("Unmasking complete", is_last=True, decrease_indent=True)
         return protein_tensor
 
@@ -211,11 +176,10 @@ class BaseDenoisingStrategy(ABC):
         protein_tensor: ESMProteinTensor,
         position: int,
         temperature: float,
-        track: str = "sequence",
         model_output = None
     ) -> ESMProteinTensor:
         """Unmask a specific position using the model's prediction."""
-        return self.unmask_positions(protein_tensor, [position], temperature, track, model_output)
+        return self.unmask_positions(protein_tensor, [position], temperature, model_output)
     
     def return_generation(
         self,
@@ -233,7 +197,6 @@ class BaseDenoisingStrategy(ABC):
         self,
         protein_tensor: ESMProteinTensor,
         num_positions: int,
-        track: str = "sequence",
         model_output = None
     ) -> list:
         """Get the next positions to unmask based on the strategy."""
@@ -242,11 +205,10 @@ class BaseDenoisingStrategy(ABC):
     def get_next_position(
         self,
         protein_tensor: ESMProteinTensor,
-        track: str = "sequence",
         model_output = None
     ) -> int:
         """Backward compatibility method for getting single position."""
-        return self.get_next_positions(protein_tensor, 1, track, model_output)[0]
+        return self.get_next_positions(protein_tensor, 1, model_output)[0]
     
     @abstractmethod
     def denoise(
@@ -262,8 +224,7 @@ class BaseDenoisingStrategy(ABC):
         return {
             "noise_percentage": self.noise_percentage,
             "num_decoding_steps": self.num_decoding_steps,
-            "temperature": self.temperature,
-            "track": self.track
+            "temperature": self.temperature
         }
 
 class EntropyBasedDenoising(BaseDenoisingStrategy):
@@ -273,7 +234,6 @@ class EntropyBasedDenoising(BaseDenoisingStrategy):
         self,
         protein_tensor: ESMProteinTensor,
         num_positions: int,
-        track: str = "sequence",
         model_output = None
     ) -> list:
         """Get multiple positions to unmask based on entropy."""
@@ -283,8 +243,7 @@ class EntropyBasedDenoising(BaseDenoisingStrategy):
             output = self.client.forward_and_sample(
                 protein_tensor,
                 sampling_configuration=SamplingConfig(
-                    sequence=SamplingTrackConfig(temperature=self.temperature, topk_logprobs=5),
-                    structure=SamplingTrackConfig(temperature=self.temperature, topk_logprobs=5),
+                    sequence=SamplingTrackConfig(temperature=self.temperature, topk_logprobs=5)
                 )
             )
             self.cost += 1
@@ -293,13 +252,12 @@ class EntropyBasedDenoising(BaseDenoisingStrategy):
             output = model_output
         
         # Get entropy directly from output
-        entropy = getattr(output.entropy, track)
+        entropy = output.entropy.sequence
         self.printer.print(f"Raw entropies: {entropy}")
         
         # Mask entropy of already unmasked positions
-        track_tensor = getattr(protein_tensor, track)
-        track_tokenizer = getattr(self.tokenizers, track)
-        is_mask = track_tensor == track_tokenizer.mask_token_id
+        sequence_tensor = protein_tensor.sequence
+        is_mask = sequence_tensor == MASK_TOKEN_ID
         
         # Set entropy to inf for non-masked positions and start/end tokens
         entropy[~is_mask] = float('inf')
@@ -319,37 +277,29 @@ class EntropyBasedDenoising(BaseDenoisingStrategy):
             
         self.printer.print(f"Selected positions: {positions}", is_last=True, decrease_indent=True)
         return positions
-    
-    def get_next_position(
-        self,
-        protein_tensor: ESMProteinTensor,
-        track: str = "sequence",
-        model_output = None
-    ) -> int:
-        """Get next position to unmask based on entropy (backward compatibility)."""
-        return self.get_next_positions(protein_tensor, 1, track, model_output)[0]
         
     def denoise(
         self,
         protein: ESMProtein,
         verbose: bool = True,
-        max_decoding_steps: int = 20,
+        max_decoding_steps: int = None,
     ) -> ESMProtein:
         """Denoise using entropy-based strategy."""
         self.printer.print("Starting entropy-based denoising process", increase_indent=True)
+        
+        # Use provided max_decoding_steps or fall back to self.num_decoding_steps
+        if max_decoding_steps is None:
+            max_decoding_steps = self.num_decoding_steps
         
         # Encode protein and add noise
         protein_tensor = self.client.encode(protein)
         assert not isinstance(protein_tensor, ESMProteinError)
         
-        if self.track == "structure":
-            protein_tensor = self.maybe_add_default_structure_tokens(protein_tensor)
-            
         # Add noise by masking positions
-        protein_tensor = self.add_noise(protein_tensor, self.noise_percentage, self.track)
+        protein_tensor = self.add_noise(protein_tensor, self.noise_percentage)
         
         # Calculate masked positions
-        total_masked = self.get_number_of_masked_positions(protein_tensor, self.track)
+        total_masked = self.get_number_of_masked_positions(protein_tensor)
         self.printer.print(f"Total masked positions: {total_masked}")
         
         # Calculate how many positions to unmask per step
@@ -386,8 +336,7 @@ class EntropyBasedDenoising(BaseDenoisingStrategy):
             output = self.client.forward_and_sample(
                 protein_tensor,
                 sampling_configuration=SamplingConfig(
-                    sequence=SamplingTrackConfig(temperature=self.temperature, topk_logprobs=5),
-                    structure=SamplingTrackConfig(temperature=self.temperature, topk_logprobs=5),
+                    sequence=SamplingTrackConfig(temperature=self.temperature, topk_logprobs=5)
                 )
             )
             self.cost += 1
@@ -395,12 +344,12 @@ class EntropyBasedDenoising(BaseDenoisingStrategy):
             
             # Get next positions using the same model output
             next_positions = self.get_next_positions(
-                protein_tensor, positions_this_step, self.track, output
+                protein_tensor, positions_this_step, output
             )
             
             # Unmask using the same model output
             protein_tensor = self.unmask_positions(
-                protein_tensor, next_positions, self.temperature, self.track, output
+                protein_tensor, next_positions, self.temperature, output
             )
             
             # Update remaining masked count
@@ -416,8 +365,7 @@ class EntropyBasedDenoising(BaseDenoisingStrategy):
         protein_tensor_output = self.client.forward_and_sample(
             protein_tensor,
             SamplingConfig(
-                sequence=SamplingTrackConfig(temperature=self.temperature),
-                structure=SamplingTrackConfig(temperature=self.temperature),
+                sequence=SamplingTrackConfig(temperature=self.temperature)
             ),
         )
         self.cost += 1
@@ -441,61 +389,85 @@ class EntropyBasedDenoising(BaseDenoisingStrategy):
 class MaxProbBasedDenoising(BaseDenoisingStrategy):
     """Denoising strategy that selects positions with highest probability for any token."""
     
-    def get_next_position(
+    def get_next_positions(
         self,
         protein_tensor: ESMProteinTensor,
-        track: str = "sequence",
+        num_positions: int,
         model_output = None
-    ) -> int:
-        """Get next position to unmask based on maximum probability."""
-        self.printer.print("Computing position probabilities", increase_indent=True)
+    ) -> list:
+        """Get multiple positions to unmask based on maximum probability."""
+        self.printer.print(f"Computing position probabilities for {num_positions} positions", increase_indent=True)
         
         if model_output is None:
             output = self.client.forward_and_sample(
                 protein_tensor,
                 sampling_configuration=SamplingConfig(
-                    sequence=SamplingTrackConfig(temperature=1.0, top_p=1.0),
-                    structure=SamplingTrackConfig(temperature=1.0, top_p=1.0),
+                    sequence=SamplingTrackConfig(temperature=1.0, top_p=1.0)
                 )
             )
             self.cost += 1
             assert not isinstance(output, ESMProteinError)
         else:
             output = model_output
-        print("Output:", output)
-        max_probs = getattr(output.top_prob, track)
+        
+        # Get max probabilities from output
+        max_probs = output.top_prob.sequence
         self.printer.print(f"Top probabilities at each position: {max_probs}")
         
         # Mask probabilities of already unmasked positions
-        track_tensor = getattr(protein_tensor, track)
-        track_tokenizer = getattr(self.tokenizers, track)
-        is_mask = track_tensor == track_tokenizer.mask_token_id
+        sequence_tensor = protein_tensor.sequence
+        is_mask = sequence_tensor == MASK_TOKEN_ID
         
         # Set probability to -inf for non-masked positions and start/end tokens
         max_probs[~is_mask] = -float('inf')  # Non-masked positions
         max_probs[0] = -float('inf')  # Start token
         max_probs[-1] = -float('inf')  # End token
         
-        self.printer.print(f"Masked positions probabilities: {max_probs}", is_last=True, decrease_indent=True)
-        return max_probs.argmax().item()
+        self.printer.print(f"Masked positions probabilities: {max_probs}")
+        
+        # Get positions with highest probability
+        positions = []
+        probs_copy = max_probs.clone()
+        
+        for i in range(min(num_positions, is_mask.sum().item())):
+            next_pos = probs_copy.argmax().item()
+            positions.append(next_pos)
+            probs_copy[next_pos] = -float('inf')  # Mark as processed
+            
+        self.printer.print(f"Selected positions: {positions}", is_last=True, decrease_indent=True)
+        return positions
         
     def denoise(
         self,
         protein: ESMProtein,
         verbose: bool = True,
+        max_decoding_steps: int = None,
     ) -> ESMProtein:
         """Denoise using max-probability strategy."""
         self.printer.print("Starting max-probability denoising process", increase_indent=True)
+        
+        # Use provided max_decoding_steps or fall back to self.num_decoding_steps
+        if max_decoding_steps is None:
+            max_decoding_steps = self.num_decoding_steps
         
         # Encode protein and add noise
         protein_tensor = self.client.encode(protein)
         assert not isinstance(protein_tensor, ESMProteinError)
         
-        if self.track == "structure":
-            protein_tensor = self.maybe_add_default_structure_tokens(protein_tensor)
-            
         # Add noise by masking positions
-        protein_tensor = self.add_noise(protein_tensor, self.noise_percentage, self.track)
+        protein_tensor = self.add_noise(protein_tensor, self.noise_percentage)
+        
+        # Calculate masked positions
+        total_masked = self.get_number_of_masked_positions(protein_tensor)
+        self.printer.print(f"Total masked positions: {total_masked}")
+        
+        # Calculate how many positions to unmask per step
+        max_steps = min(max_decoding_steps, self.num_decoding_steps)
+        positions_per_step = self.calculate_positions_per_step(total_masked, max_steps)
+        actual_steps = min((total_masked + positions_per_step - 1) // positions_per_step, max_steps)
+        
+        self.printer.print(f"Positions per step: {positions_per_step}")
+        self.printer.print(f"Actual number of steps: {actual_steps}")
         
         # Print initial sequence
         initial_decoded = self.client.decode(protein_tensor)
@@ -504,32 +476,43 @@ class MaxProbBasedDenoising(BaseDenoisingStrategy):
         
         self.printer.print("Starting denoising steps:", increase_indent=True)
         if verbose:
-            pbar = tqdm(range(self.num_decoding_steps), desc="Denoising")
+            pbar = tqdm(range(actual_steps), desc="Denoising")
         else:
-            pbar = range(self.num_decoding_steps)
+            pbar = range(actual_steps)
             
+        remaining_masked = total_masked
+        
         for step in pbar:
-            is_last_step = step == self.num_decoding_steps - 1
-            self.printer.print(f"Step {step+1}/{self.num_decoding_steps}", increase_indent=True)
+            is_last_step = step == actual_steps - 1
+            self.printer.print(f"Step {step+1}/{actual_steps}", increase_indent=True)
             
+            # On last step, handle any remaining positions
+            positions_this_step = min(positions_per_step, remaining_masked)
+            if is_last_step:
+                positions_this_step = remaining_masked
+                
             # Get model output once per step
             output = self.client.forward_and_sample(
                 protein_tensor,
                 sampling_configuration=SamplingConfig(
-                    sequence=SamplingTrackConfig(temperature=1.0, top_p=1.0),
-                    structure=SamplingTrackConfig(temperature=1.0, top_p=1.0),
+                    sequence=SamplingTrackConfig(temperature=1.0, top_p=1.0)
                 )
             )
             self.cost += 1
             assert not isinstance(output, ESMProteinError)
             
-            # Get next position using the same model output
-            next_pos = self.get_next_position(protein_tensor, self.track, output)
+            # Get next positions using the same model output
+            next_positions = self.get_next_positions(
+                protein_tensor, positions_this_step, output
+            )
             
             # Unmask using the same model output
-            protein_tensor = self.unmask_position(
-                protein_tensor, next_pos, self.temperature, self.track, output
+            protein_tensor = self.unmask_positions(
+                protein_tensor, next_positions, self.temperature, output
             )
+            
+            # Update remaining masked count
+            remaining_masked -= len(next_positions)
             
             if verbose:
                 after_unmask_decoded = self.client.decode(protein_tensor)
@@ -541,8 +524,7 @@ class MaxProbBasedDenoising(BaseDenoisingStrategy):
         protein_tensor_output = self.client.forward_and_sample(
             protein_tensor,
             SamplingConfig(
-                sequence=SamplingTrackConfig(temperature=self.temperature),
-                structure=SamplingTrackConfig(temperature=self.temperature),
+                sequence=SamplingTrackConfig(temperature=self.temperature)
             ),
         )
         self.cost += 1
