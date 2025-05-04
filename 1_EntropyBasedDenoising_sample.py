@@ -26,7 +26,7 @@ from denoising_strategies import Tee, PrintFormatter
 
 # Import the BaseDenoisingStrategy and MaxProbBasedDenoising classes
 from denoising_strategies import BaseDenoisingStrategy, MaxProbBasedDenoising, EntropyBasedDenoising
-from benchmarking_utils import single_metric_UACCE
+from benchmarking import single_metric_UACCE
 
 ## On Forge with larger ESM3 models
 from esm.sdk import client

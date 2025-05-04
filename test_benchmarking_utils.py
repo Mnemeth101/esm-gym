@@ -1,16 +1,43 @@
 import unittest
 from unittest.mock import MagicMock, patch
 from esm.sdk.api import ESM3InferenceClient, ESMProtein, LogitsConfig, GenerationConfig, ESMProteinError
+import os
+import json
+import tempfile
+import torch
+import numpy as np
+from typing import List, Dict, Any, Optional
 
-from benchmarking_utils import (
+from benchmarking import (
     single_metric_UACCE,
     single_metric_average_pLDDT,
     single_metric_pTM,
     single_metric_foldability,
     aggregated_metric_entropy,
     aggregated_metric_diversity,
-    levenshtein_distance
+    aggregated_cosine_similarities,
+    BenchmarkRunner,
+    load_protein_from_fasta,
 )
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Calculate the Levenshtein distance between two strings."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    
+    previous_row = range(len(s2) + 1)
+    for i, c1 in enumerate(s1):
+        current_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = previous_row[j + 1] + 1
+            deletions = current_row[j] + 1
+            substitutions = previous_row[j] + (c1 != c2)
+            current_row.append(min(insertions, deletions, substitutions))
+        previous_row = current_row
+    
+    return previous_row[-1]
 
 class TestBenchmarkingUtils(unittest.TestCase):
 
@@ -194,7 +221,7 @@ class TestBenchmarkingUtils(unittest.TestCase):
         
         # For testing ESMProteinError handling, we'll patch the isinstance function
         # in the specific module where it's used to control its behavior
-        with patch('benchmarking_utils.isinstance') as mock_isinstance:
+        with patch('benchmarking.metrics.isinstance') as mock_isinstance:
             # Set up the mock to return True only when checking if something is an ESMProteinError
             def side_effect(obj, class_type):
                 if class_type == ESMProteinError:
@@ -368,6 +395,50 @@ class TestBenchmarkingUtils(unittest.TestCase):
         # Should raise ValueError for identity calculation
         with self.assertRaises(ValueError):
             aggregated_metric_diversity(unequal_sequences, method="identity")
+
+    def test_aggregated_cosine_similarities(self):
+        """Test cosine similarity calculation between protein embeddings"""
+        # Mock forge client and its responses
+        mock_forge_client = MagicMock()
+        mock_forge_client.encode.return_value = MagicMock()
+        mock_forge_client.logits.return_value = MagicMock(
+            embeddings=torch.randn(1, 1, 2560)  # Mock embedding tensor
+        )
+        
+        # Mock environment variable
+        with patch.dict('os.environ', {'ESM_FORGE_API_KEY': 'test_token'}):
+            with patch('benchmarking.metrics.ESM3ForgeInferenceClient', return_value=mock_forge_client):
+                # Test with sample sequences
+                original_protein = "ACDEFGHIKL"
+                proteins = ["ACDEFGHIKM", "ACDEFGHIKP", "ACDEFGHIKS"]
+                
+                # Call the function
+                similarities = aggregated_cosine_similarities(proteins, original_protein, verbose=False)
+                
+                # Check results
+                self.assertIsInstance(similarities, list)
+                self.assertEqual(len(similarities), len(proteins))
+                self.assertTrue(all(isinstance(s, float) for s in similarities))
+                eps = 1e-6
+                self.assertTrue(all(-1.0 - eps <= s <= 1.0 + eps) for s in similarities) # Cosine similarity range
+
+    def test_load_protein_from_fasta(self):
+        """Test loading protein from FASTA file"""
+        # Create a temporary FASTA file
+        with tempfile.NamedTemporaryFile(mode='w', suffix='.fasta', delete=False) as f:
+            f.write(">test_protein\nACDEFGHIKL\n")
+            fasta_path = f.name
+        
+        try:
+            # Load protein
+            protein = load_protein_from_fasta(fasta_path)
+            
+            # Check results
+            self.assertIsInstance(protein, ESMProtein)
+            self.assertEqual(protein.sequence, "ACDEFGHIKL")
+        finally:
+            # Clean up
+            os.unlink(fasta_path)
 
 if __name__ == "__main__":
     unittest.main()

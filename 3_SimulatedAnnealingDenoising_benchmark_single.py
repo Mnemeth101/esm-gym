@@ -1,4 +1,4 @@
-from benchmarking_utils import BenchmarkRunner, get_smallest_pdb_file, save_benchmark_results
+from benchmarking import BenchmarkRunner, load_protein_from_fasta
 from esm.sdk.api import ESM3InferenceClient, ESMProtein
 import os
 
