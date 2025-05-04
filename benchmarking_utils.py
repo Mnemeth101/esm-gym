@@ -568,7 +568,9 @@ def _parallel_benchmark_worker(args):
     try:
         denoising_module = importlib.import_module('denoising_strategies')
         strategy_class = getattr(denoising_module, strategy_class_name)
-        worker_strategy = strategy_class(**strategy_params)
+        
+        # Use the factory method to create the strategy with filtered parameters
+        worker_strategy = strategy_class.create(**strategy_params)
     except Exception as e:
         return {
             "run_id": run_id,
@@ -996,6 +998,34 @@ class BenchmarkRunner:
                 avg_time = np.mean(times) if times else 0
                 std_time = np.std(times) if times else 0
                 
+                # Calculate cosine similarities with ESM-C embeddings
+                try:
+                    print("Calculating ESM-C cosine similarities...")
+                    cosine_similarities = aggregated_cosine_similarities(
+                        proteins=sequences,
+                        original_protein=self.source_protein.sequence,
+                        verbose=True
+                    )
+                    
+                    # Calculate average similarity
+                    valid_similarities = [s for s in cosine_similarities if s is not None]
+                    avg_cosine_similarity = np.mean(valid_similarities) if valid_similarities else None
+                    
+                    print(f"Average ESM-C cosine similarity: {avg_cosine_similarity:.4f}")
+                    
+                    # Save cosine similarities to a separate file
+                    similarities_file = os.path.join(job_folder, "cosine_similarities.txt")
+                    with open(similarities_file, 'w') as f:
+                        f.write(f"ESM-C cosine similarities for {strategy_name}:\n")
+                        f.write(f"Average similarity: {avg_cosine_similarity:.4f}\n\n")
+                        for i, sim in enumerate(cosine_similarities):
+                            f.write(f"Protein {i+1}: {sim:.6f}\n")
+                    
+                except Exception as e:
+                    print(f"Error calculating cosine similarities: {e}")
+                    cosine_similarities = None
+                    avg_cosine_similarity = None
+                
                 # Average single metrics across all proteins
                 avg_single_metrics = self._average_single_metrics(single_metrics)
                 
@@ -1022,7 +1052,9 @@ class BenchmarkRunner:
                     "single_metrics": single_metrics,  # Store all individual metrics
                     "generated_proteins": generated_proteins,
                     "costs": costs,
-                    "times": times
+                    "times": times,
+                    "cosine_similarities": cosine_similarities,
+                    "avg_cosine_similarity": avg_cosine_similarity
                 }
                 
                 # Add the source protein name or path to the results
@@ -1247,6 +1279,34 @@ class BenchmarkRunner:
                 avg_time = np.mean(times) if times else 0
                 std_time = np.std(times) if times else 0
                 
+                # Calculate cosine similarities with ESM-C embeddings
+                try:
+                    print("Calculating ESM-C cosine similarities...")
+                    cosine_similarities = aggregated_cosine_similarities(
+                        proteins=sequences,
+                        original_protein=self.source_protein.sequence,
+                        verbose=True
+                    )
+                    
+                    # Calculate average similarity
+                    valid_similarities = [s for s in cosine_similarities if s is not None]
+                    avg_cosine_similarity = np.mean(valid_similarities) if valid_similarities else None
+                    
+                    print(f"Average ESM-C cosine similarity: {avg_cosine_similarity:.4f}")
+                    
+                    # Save cosine similarities to a separate file
+                    similarities_file = os.path.join(job_folder, "cosine_similarities.txt")
+                    with open(similarities_file, 'w') as f:
+                        f.write(f"ESM-C cosine similarities for {strategy_name}:\n")
+                        f.write(f"Average similarity: {avg_cosine_similarity:.4f}\n\n")
+                        for i, sim in enumerate(cosine_similarities):
+                            f.write(f"Protein {i+1}: {sim:.6f}\n")
+                    
+                except Exception as e:
+                    print(f"Error calculating cosine similarities: {e}")
+                    cosine_similarities = None
+                    avg_cosine_similarity = None
+                
                 # Average single metrics across all proteins
                 avg_single_metrics = self._average_single_metrics(single_metrics)
                 
@@ -1273,7 +1333,9 @@ class BenchmarkRunner:
                     "single_metrics": single_metrics,  # Store all individual metrics
                     "generated_proteins": generated_proteins,
                     "costs": costs,
-                    "times": times
+                    "times": times,
+                    "cosine_similarities": cosine_similarities,
+                    "avg_cosine_similarity": avg_cosine_similarity
                 }
                 
                 # Add the source protein name or path to the results
@@ -1501,4 +1563,4 @@ def save_benchmark_results(runner: BenchmarkRunner, output_file=None):
         )
         
     print(f"Benchmark results saved to {output_file}")
-    return output_file 
+    return output_file
