@@ -115,6 +115,7 @@ class BaseDenoisingStrategy(ABC):
         self.noise_percentage = noise_percentage
         self.num_decoding_steps = num_decoding_steps
         self.temperature = temperature
+        self.MASK_TOKEN_ID = MASK_TOKEN_ID
         
     def add_noise(
         self,
@@ -211,6 +212,10 @@ class BaseDenoisingStrategy(ABC):
         """Unmask a specific position using the model's prediction."""
         return self.unmask_positions(protein_tensor, [position], temperature, model_output)
     
+    def get_temperature(self, protein_tensor: ESMProteinTensor) -> float:
+        """Get temperature for sampling. Can be overridden by subclasses."""
+        return self.temperature
+    
     def return_generation(
         self,
     ) -> Tuple[ESMProtein, int]:
@@ -222,14 +227,6 @@ class BaseDenoisingStrategy(ABC):
         """
         return [self.protein, self.cost]
 
-    def get_temperature(self, protein_tensor: ESMProteinTensor) -> float:
-        """
-        Get the temperature to use for the current step.
-        Default implementation returns the fixed temperature.
-        Subclasses can override for dynamic temperature strategies.
-        """
-        return self.temperature
-    
     @abstractmethod
     def get_next_positions(
         self,
@@ -245,9 +242,8 @@ class BaseDenoisingStrategy(ABC):
         protein_tensor: ESMProteinTensor,
         model_output = None
     ) -> int:
-        """Get the next position to unmask based on the strategy."""
-        positions = self.get_next_positions(protein_tensor, 1, model_output)
-        return positions[0]
+        """Backward compatibility method for getting single position."""
+        return self.get_next_positions(protein_tensor, 1, model_output)[0]
     
     def denoise(
         self,
@@ -255,67 +251,106 @@ class BaseDenoisingStrategy(ABC):
         verbose: bool = True,
         max_decoding_steps: int = None,
     ) -> ESMProtein:
-        """
-        Denoise a protein sequence using the strategy.
+        """Denoise a protein sequence using the specific strategy."""
+        self.printer.print("Starting denoising process", increase_indent=True)
         
-        Args:
-            protein: The protein to denoise
-            verbose: Whether to print progress
-            max_decoding_steps: Maximum number of decoding steps (overrides num_decoding_steps)
+        # Use provided max_decoding_steps or fall back to self.num_decoding_steps
+        if max_decoding_steps is None:
+            max_decoding_steps = self.num_decoding_steps
+        
+        # Encode protein and add noise
+        protein_tensor = self.client.encode(protein)
+        assert not isinstance(protein_tensor, ESMProteinError)
+        
+        # Add noise by masking positions
+        protein_tensor = self.add_noise(protein_tensor, self.noise_percentage)
+        
+        # Calculate masked positions
+        total_masked = self.get_number_of_masked_positions(protein_tensor)
+        self.printer.print(f"Total masked positions: {total_masked}")
+        
+        # Calculate how many positions to unmask per step
+        max_steps = min(max_decoding_steps, self.num_decoding_steps)
+        positions_per_step = self.calculate_positions_per_step(total_masked, max_steps)
+        actual_steps = min((total_masked + positions_per_step - 1) // positions_per_step, max_steps)
+        
+        self.printer.print(f"Positions per step: {positions_per_step}")
+        self.printer.print(f"Actual number of steps: {actual_steps}")
+        
+        # Print initial sequence
+        initial_decoded = self.client.decode(protein_tensor)
+        assert not isinstance(initial_decoded, ESMProteinError)
+        self.printer.print(f"Initial sequence: {initial_decoded.sequence}")
+        
+        self.printer.print("Starting denoising steps:", increase_indent=True)
+        if verbose:
+            pbar = tqdm(range(actual_steps), desc="Denoising")
+        else:
+            pbar = range(actual_steps)
             
-        Returns:
-            The denoised protein
-        """
-        self.protein = protein
-        self.cost = 0
+        remaining_masked = total_masked
         
-        if max_decoding_steps is not None:
-            self.num_decoding_steps = max_decoding_steps
+        for step in pbar:
+            is_last_step = step == actual_steps - 1
+            self.printer.print(f"Step {step+1}/{actual_steps}", increase_indent=True)
             
-        # Add noise to the protein
-        protein_tensor = self.add_noise(protein.protein_tensor, self.noise_percentage)
-        
-        # Get initial number of masked positions
-        num_masked = self.get_number_of_masked_positions(protein_tensor)
-        if num_masked == 0:
-            return protein
-            
-        # Calculate positions to unmask per step
-        positions_per_step = self.calculate_positions_per_step(
-            num_masked, self.num_decoding_steps
-        )
-        
-        # Main denoising loop
-        for step in range(self.num_decoding_steps):
-            if verbose:
-                print(f"\nStep {step + 1}/{self.num_decoding_steps}")
+            # On last step, handle any remaining positions
+            positions_this_step = min(positions_per_step, remaining_masked)
+            if is_last_step:
+                positions_this_step = remaining_masked
                 
-            # Get next positions to unmask
-            positions = self.get_next_positions(protein_tensor, positions_per_step)
+            # Get model output once per step
+            output = self.client.forward_and_sample(
+                protein_tensor,
+                sampling_configuration=SamplingConfig(
+                    sequence=SamplingTrackConfig(temperature=self.get_temperature(protein_tensor))
+                )
+            )
+            self.cost += 1
+            assert not isinstance(output, ESMProteinError)
             
-            # Get temperature for this step
-            temperature = self.get_temperature(protein_tensor)
-            
-            # Unmask the positions
-            protein_tensor = self.unmask_positions(
-                protein_tensor, positions, temperature
+            # Get next positions using the same model output
+            next_positions = self.get_next_positions(
+                protein_tensor, positions_this_step, output
             )
             
-            # Check if we're done
-            num_masked = self.get_number_of_masked_positions(protein_tensor)
-            if num_masked == 0:
-                break
-                
-        # Create final protein
-        final_protein = ESMProtein(protein_tensor)
-        self.protein = final_protein
+            # Unmask using the same model output
+            protein_tensor = self.unmask_positions(
+                protein_tensor, next_positions, self.get_temperature(protein_tensor), output
+            )
+            
+            # Update remaining masked count
+            remaining_masked -= len(next_positions)
+            
+            if verbose:
+                after_unmask_decoded = self.client.decode(protein_tensor)
+                assert not isinstance(after_unmask_decoded, ESMProteinError)
+                self.printer.print(f"Current sequence: {after_unmask_decoded.sequence}", 
+                                 is_last=True, decrease_indent=True)
         
-        return final_protein
+        # Final prediction
+        protein_tensor_output = self.client.forward_and_sample(
+            protein_tensor,
+            SamplingConfig(
+                sequence=SamplingTrackConfig(temperature=self.get_temperature(protein_tensor))
+            ),
+        )
+        self.cost += 1
+        
+        assert not isinstance(protein_tensor_output, ESMProteinError)
+        protein_tensor = protein_tensor_output.protein_tensor
+        
+        decoded_protein = self.client.decode(protein_tensor)
+        assert not isinstance(decoded_protein, ESMProteinError)
+        self.printer.print(f"Final denoised sequence: {decoded_protein.sequence}")
+        self.printer.print(f"Total model calls: {self.cost}", is_last=True, decrease_indent=True)
+        self.protein = decoded_protein
+        return decoded_protein
     
     def _extract_strategy_params(self) -> dict:
-        """Extract strategy-specific parameters for logging."""
+        """Extract base parameters common to all denoising strategies."""
         return {
-            'noise_percentage': self.noise_percentage,
-            'num_decoding_steps': self.num_decoding_steps,
-            'temperature': self.temperature,
+            "noise_percentage": self.noise_percentage,
+            "num_decoding_steps": self.num_decoding_steps,
+            "temperature": self.temperature
         } 

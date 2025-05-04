@@ -31,7 +31,7 @@ from benchmarking import single_metric_UACCE
 ## On Forge with larger ESM3 models
 from esm.sdk import client
 token = os.getenv("ESM_FORGE_API_KEY")
-model = client(model="esm3-open", url="https://forge.evolutionaryscale.ai", token=token)
+model = client(model="esm3-large-2024-03", url="https://forge.evolutionaryscale.ai", token=token)
 # --- Configuration ---
 TEST_SEQUENCE = "ACDETSLAQGKACDETSLAQGKACDETSLAQGKACDETSLAQGK"
 NOISE_PERCENTAGE = 80.0
@@ -50,7 +50,6 @@ denoiser = EntropyBasedDenoising(
     noise_percentage=NOISE_PERCENTAGE,
     num_decoding_steps=NUM_DECODING_STEPS,
     temperature=TEMPERATURE,
-    track=TRACK
 )
 
 # Call denoise with just the protein

@@ -119,18 +119,22 @@ def single_metric_average_pLDDT(protein: ESMProtein) -> float:
     if plddts is None:
         raise ValueError("pLDDT scores are not available for this protein.")
 
-    plddt = plddts.mean()
+    # Convert tensor to float
+    plddt = plddts.mean().item()  
     return plddt
 
 def single_metric_pTM(protein: ESMProtein) -> float:
     """
     Return the pTM score for a protein structure.
     """
-    pTM = protein.ptm
-    if pTM is None:
+    pTM_value = protein.ptm
+    if pTM_value is None:
         raise ValueError("pTM scores are not available for this protein.")
     
-    return pTM
+    # Convert tensor to float if necessary
+    if isinstance(pTM_value, torch.Tensor):
+        return pTM_value.item()
+    return float(pTM_value) # Ensure it's a float even if not a tensor initially
 
 def single_metric_foldability(client: ESM3InferenceClient, protein: ESMProtein, num_samples: int = 5, verbose: bool = False) -> float:
     """
@@ -190,14 +194,20 @@ def single_metric_foldability(client: ESM3InferenceClient, protein: ESMProtein, 
                 raise ValueError("Protein structure generation failed.")
             
             # Check foldability criteria
-            plddt = protein.plddt.mean()
+            # Ensure plddt is a float
+            plddt = protein.plddt.mean().item() 
+            # Ensure ptm is a float
             ptm = protein.ptm
-            
+            if isinstance(ptm, torch.Tensor):
+                ptm = ptm.item()
+            else:
+                ptm = float(ptm)
+
             if verbose:
                 print(f"  pLDDT: {plddt:.2f}, pTM: {ptm:.2f}")
                 
             # Check if this sample meets all criteria
-            if plddt > .80 and ptm > 0.7:
+            if plddt > 0.80 and ptm > 0.7: # Use 0.80 for comparison
                 successful_count += 1
                 if verbose:
                     print("  ✓ Sample meets foldability criteria")
@@ -440,6 +450,7 @@ def aggregated_cosine_similarities(proteins: List[str], original_protein: str, v
             protein_embedding_norm = F.normalize(protein_embedding, p=2, dim=0)
             
             # Calculate cosine similarity (dot product of normalized vectors)
+            # Ensure similarity is converted to float using .item()
             similarity = torch.dot(original_embedding_norm, protein_embedding_norm).item()
             similarities.append(similarity)
             
@@ -458,4 +469,4 @@ def aggregated_cosine_similarities(proteins: List[str], original_protein: str, v
             print(f"Min similarity: {np.min(valid_similarities):.4f}")
             print(f"Max similarity: {np.max(valid_similarities):.4f}")
     
-    return similarities 
+    return similarities

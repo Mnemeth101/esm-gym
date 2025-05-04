@@ -9,7 +9,6 @@ from .metrics import (
 )
 from .runner import BenchmarkRunner
 from .utils import (
-    load_protein_from_fasta,
     load_benchmark_results,
     compare_benchmark_results,
     save_comparison_results
@@ -29,7 +28,6 @@ __all__ = [
     "BenchmarkRunner",
     
     # Utils
-    "load_protein_from_fasta",
     "load_benchmark_results",
     "compare_benchmark_results",
     "save_comparison_results"

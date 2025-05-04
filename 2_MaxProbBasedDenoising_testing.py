@@ -26,8 +26,7 @@ from denoising_strategies import Tee, PrintFormatter, MaxProbBasedDenoising
 # Initialize the ESM3InferenceClient
 from esm.sdk import client
 token = os.getenv("ESM_FORGE_API_KEY")
-model = client(model="esm3-open", url="https://forge.evolutionaryscale.ai", token=token)
-
+model = client(model="esm3-large-2024-03", url="https://forge.evolutionaryscale.ai", token=token)
 # --- Configuration ---
 TEST_SEQUENCE = "ACDE"
 NOISE_PERCENTAGE = 50.0  # Mask 50% initially (2 positions for length 4)

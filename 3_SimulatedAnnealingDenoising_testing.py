@@ -26,7 +26,7 @@ from denoising_strategies import Tee, PrintFormatter, SimulatedAnnealingDenoisin
 # Initialize the ESM3InferenceClient
 from esm.sdk import client
 token = os.getenv("ESM_FORGE_API_KEY")
-model = client(model="esm3-open", url="https://forge.evolutionaryscale.ai", token=token)
+model = client(model="esm3-large-2024-03", url="https://forge.evolutionaryscale.ai", token=token)
 
 # --- Configuration ---
 TEST_SEQUENCE = "ACDEFGHIKLMNPQRSTVWYACDEFGHIKLMNPQRSTVWY"  # A longer test sequence for SA
@@ -49,10 +49,11 @@ sa_denoiser = SimulatedAnnealingDenoising(
 )
 
 # Test the denoising process
-denoised_protein, cost = sa_denoiser.denoise(
+sa_denoiser.denoise(
     protein=protein,
     verbose=True
 )
+denoised_protein, cost = sa_denoiser.return_generation()
 
 print(f"\nOriginal sequence: {protein.sequence}")
 print(f"Denoised sequence: {denoised_protein.sequence}")
