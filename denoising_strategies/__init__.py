@@ -6,6 +6,7 @@ from .base import (
 )
 
 from .standard_strategies import (
+    OneShotDenoising,
     EntropyBasedDenoising,
     MaxProbBasedDenoising,
     SimulatedAnnealingDenoising,

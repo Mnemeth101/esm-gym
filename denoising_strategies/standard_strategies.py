@@ -375,28 +375,54 @@ class SimulatedAnnealingDenoising(BaseDenoisingStrategy):
         client: ESM3InferenceClient,
         noise_percentage: float = 50.0,
         num_decoding_steps: int = 20,
-        base_temperature: float = 1.0,  # Maximum temperature when fully masked
+        base_temperature: float = 1.0,  # Maximum temperature at the start
+        schedule_type: str = 'linear', # 'linear' or 'cosine'
     ):
         # Initialize with base_temperature, but the actual temperature used will vary
-        super().__init__(client, noise_percentage, num_decoding_steps, temperature=0.0)
+        super().__init__(client, noise_percentage, num_decoding_steps, temperature=0.0) # Base class temp not used directly
         self.base_temperature = base_temperature
-    
+        if schedule_type not in ['linear', 'cosine']:
+            raise ValueError("schedule_type must be 'linear' or 'cosine'")
+        self.schedule_type = schedule_type
+        self.initial_mask_fraction: Optional[float] = None # Store initial mask fraction
+
     def get_temperature(self, protein_tensor: ESMProteinTensor) -> float:
-        """Get temperature based on number of masked positions."""
+        """Get temperature based on number of masked positions and schedule type."""
         num_masked = self.get_number_of_masked_positions(protein_tensor)
-        # Ensure total_positions is calculated based on the tensor length
         total_positions = len(protein_tensor.sequence) - 2  # Exclude start/end tokens
-        
-        if total_positions <= 0: # Avoid division by zero if sequence is too short
+
+        if total_positions <= 0 or self.initial_mask_fraction is None or self.initial_mask_fraction == 0:
+            # Handle edge cases: no positions, denoising not started, or no initial masks
+            self.printer.print(f"Calculated temperature: 0.0 (Edge case: total_positions={total_positions}, initial_mask_fraction={self.initial_mask_fraction})")
             return 0.0
-            
-        # Temperature decreases linearly as positions get unmasked
-        mask_fraction = num_masked / total_positions
-        temperature = self.base_temperature * mask_fraction # Temperature proportional to mask fraction
-        
-        self.printer.print(f"Calculated temperature: {temperature:.4f} (Masked: {num_masked}/{total_positions})")
+
+        current_mask_fraction = num_masked / total_positions
+
+        if self.schedule_type == 'linear':
+            # Scale linearly from base_temperature to 0 based on remaining mask fraction relative to initial
+            temperature = self.base_temperature * (current_mask_fraction / self.initial_mask_fraction)
+            # Clamp temperature between 0 and base_temperature
+            temperature = max(0.0, min(temperature, self.base_temperature))
+            self.printer.print(f"Calculated temperature (Linear): {temperature:.4f} (Current Mask: {current_mask_fraction:.2f}, Initial Mask: {self.initial_mask_fraction:.2f})")
+
+        elif self.schedule_type == 'cosine':
+            # Calculate progress (0 at start, 1 at end)
+            progress = 1.0 - (current_mask_fraction / self.initial_mask_fraction)
+            # Clamp progress between 0 and 1 to handle potential float inaccuracies
+            progress = max(0.0, min(progress, 1.0))
+            # Cosine schedule: T_max * 0.5 * (1 + cos(pi * progress))
+            temperature = self.base_temperature * 0.5 * (1.0 + math.cos(math.pi * progress))
+            # Clamp temperature between 0 and base_temperature
+            temperature = max(0.0, min(temperature, self.base_temperature))
+            self.printer.print(f"Calculated temperature (Cosine): {temperature:.4f} (Progress: {progress:.2f}, Initial Mask: {self.initial_mask_fraction:.2f})")
+        else:
+            # Should not happen due to check in __init__
+            temperature = 0.0
+            self.printer.print(f"Calculated temperature: 0.0 (Unknown schedule type)")
+
+
         return temperature
-    
+
     def get_next_positions(
         self,
         protein_tensor: ESMProteinTensor,
@@ -464,8 +490,10 @@ class SimulatedAnnealingDenoising(BaseDenoisingStrategy):
         max_decoding_steps: int = None,
     ) -> ESMProtein:
         """Denoise using simulated annealing strategy."""
-        self.printer.print("Starting simulated annealing denoising process", increase_indent=True)
-        
+        self.printer.print(f"Starting simulated annealing denoising process (Schedule: {self.schedule_type})", increase_indent=True)
+        self.cost = 0 # Reset cost counter
+        self.initial_mask_fraction = None # Reset initial mask fraction
+
         # Use provided max_decoding_steps or fall back to self.num_decoding_steps
         if max_decoding_steps is None:
             max_decoding_steps = self.num_decoding_steps
@@ -480,6 +508,16 @@ class SimulatedAnnealingDenoising(BaseDenoisingStrategy):
         # Calculate masked positions
         total_masked = self.get_number_of_masked_positions(protein_tensor)
         self.printer.print(f"Total masked positions: {total_masked}")
+
+        # Store initial mask fraction
+        total_positions = len(protein_tensor.sequence) - 2
+        if total_positions > 0:
+            self.initial_mask_fraction = total_masked / total_positions
+            self.printer.print(f"Initial mask fraction: {self.initial_mask_fraction:.4f}")
+        else:
+            self.initial_mask_fraction = 0.0 # Or None, handled in get_temperature
+            self.printer.print("Initial mask fraction: N/A (sequence too short)")
+
 
         if total_masked == 0:
             self.printer.print("No positions were masked, returning original protein.", is_last=True, decrease_indent=True)
@@ -590,4 +628,88 @@ class SimulatedAnnealingDenoising(BaseDenoisingStrategy):
         params = super()._extract_strategy_params()
         params['strategy'] = 'simulated_annealing'
         params['base_temperature'] = self.base_temperature
-        return params 
+        params['schedule_type'] = self.schedule_type # Add schedule type
+        return params
+
+class OneShotDenoising(BaseDenoisingStrategy):
+    """Denoising strategy that unmasks all positions in a single step."""
+
+    def __init__(
+        self,
+        client: ESM3InferenceClient,
+        noise_percentage: float = 50.0,
+        temperature: float = 0.0,
+    ):
+        # num_decoding_steps is irrelevant here, set to 1 conceptually
+        super().__init__(client, noise_percentage, num_decoding_steps=1, temperature=temperature)
+
+    def get_next_positions(
+        self,
+        protein_tensor: ESMProteinTensor,
+        num_positions: int,
+        model_output = None
+    ) -> List[int]:
+        """Not used in OneShotDenoising."""
+        raise NotImplementedError("get_next_positions is not applicable for OneShotDenoising")
+
+    def denoise(
+        self,
+        protein: ESMProtein,
+        verbose: bool = True,
+        max_decoding_steps: int = None, # Ignored, always 1 step
+    ) -> ESMProtein:
+        """Denoise using a single forward pass."""
+        self.printer.print("Starting one-shot denoising process", increase_indent=True)
+        self.cost = 0 # Reset cost counter
+
+        # Encode protein
+        protein_tensor = self.client.encode(protein)
+        assert not isinstance(protein_tensor, ESMProteinError), "Model encode failed"
+
+        # Add noise by masking positions
+        protein_tensor = self.add_noise(protein_tensor, self.noise_percentage)
+
+        # Calculate masked positions
+        total_masked = self.get_number_of_masked_positions(protein_tensor)
+        self.printer.print(f"Total masked positions: {total_masked}")
+
+        if total_masked == 0:
+            self.printer.print("No positions were masked, returning original protein.", is_last=True, decrease_indent=True)
+            decoded_protein = self.client.decode(protein_tensor)
+            assert not isinstance(decoded_protein, ESMProteinError), "Model decode failed"
+            self.protein = decoded_protein
+            return self.protein
+
+        # Print initial sequence
+        initial_decoded = self.client.decode(protein_tensor)
+        assert not isinstance(initial_decoded, ESMProteinError), "Model decode failed"
+        self.printer.print(f"Initial sequence: {initial_decoded.sequence}")
+
+        # Perform a single forward pass to unmask everything
+        self.printer.print(f"Performing single forward pass to unmask {total_masked} positions with T={self.temperature}.")
+        protein_tensor_output = self.client.forward_and_sample(
+            protein_tensor,
+            SamplingConfig(
+                sequence=SamplingTrackConfig(temperature=self.temperature)
+            ),
+        )
+        self.cost += 1
+        assert not isinstance(protein_tensor_output, ESMProteinError), "One-shot model forward_and_sample failed"
+
+        # The result is directly in the output tensor
+        protein_tensor = protein_tensor_output.protein_tensor
+
+        # Decode the final result
+        decoded_protein = self.client.decode(protein_tensor)
+        assert not isinstance(decoded_protein, ESMProteinError), "Final model decode failed"
+        self.printer.print(f"Final denoised sequence: {decoded_protein.sequence}")
+        self.printer.print(f"Total model calls: {self.cost}", is_last=True, decrease_indent=True) # Back from start
+        self.protein = decoded_protein
+        return decoded_protein
+
+    def _extract_strategy_params(self) -> dict:
+        params = super()._extract_strategy_params()
+        params['strategy'] = 'one_shot'
+        # Remove num_decoding_steps as it's always 1
+        params.pop('num_decoding_steps', None)
+        return params
