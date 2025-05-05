@@ -18,9 +18,10 @@ source_protein = ESMProtein.from_pdb(pdb_file)
 # Use base_temperature instead of temperature for this strategy
 denoising_strategy = SimulatedAnnealingDenoising(
     client=model,
-    num_decoding_steps=3,
+    num_decoding_steps=20,
     noise_percentage=50.0,
     base_temperature=1.0,
+    schedule_type='cosine' # Added schedule_type
 )
 
 # Create the BenchmarkRunner with the client and strategy name
@@ -30,7 +31,7 @@ if __name__ == '__main__':
     # Run the benchmark - pass the protein and strategy
     # results = runner.run_benchmark(source_protein, denoising_strategy, num_trials=10, verbose=True)
     # Use the parallel version:
-    results = runner.run_benchmark_parallel(source_protein, denoising_strategy, num_trials=10, verbose=True)
+    results = runner.run_benchmark_parallel(source_protein, denoising_strategy, num_trials=50, verbose=True, n_processes=8)
 
     # No need to manually save results - they're automatically saved in the job folder
     print(f"Benchmark complete - results saved in data/benchmarking_results/SimulatedAnnealingDenoising_*")

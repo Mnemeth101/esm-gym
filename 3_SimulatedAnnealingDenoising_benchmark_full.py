@@ -24,6 +24,7 @@ def run_benchmark(
     num_decoding_steps: int = 20,
     noise_percentage: float = 50.0,
     base_temperature: float = 1.0,
+    schedule_type: str = 'linear', # Added schedule_type parameter
     num_samples: int = 5
 ) -> Dict:
     """Run benchmark for SimulatedAnnealingDenoising strategy."""
@@ -33,7 +34,8 @@ def run_benchmark(
         client=client,
         noise_percentage=noise_percentage,
         num_decoding_steps=num_decoding_steps,
-        base_temperature=base_temperature
+        base_temperature=base_temperature,
+        schedule_type=schedule_type # Pass schedule_type
     )
     
     # Initialize results
@@ -119,6 +121,7 @@ def main():
         num_decoding_steps=20,
         noise_percentage=50.0,
         base_temperature=1.0,
+        schedule_type='linear', # Pass schedule_type
         num_samples=5
     )
     
@@ -135,4 +138,4 @@ def main():
     print(f"Average cost: {avg_cost}")
 
 if __name__ == "__main__":
-    main() 
+    main()

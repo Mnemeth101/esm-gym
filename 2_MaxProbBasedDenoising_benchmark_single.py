@@ -19,7 +19,7 @@ source_protein = ESMProtein.from_pdb(pdb_file)
 denoising_strategy = MaxProbBasedDenoising(
     client=model,
     noise_percentage=50.0,  
-    num_decoding_steps=3,    
+    num_decoding_steps=20,    
     temperature=0.5
 )
 
@@ -30,7 +30,7 @@ if __name__ == '__main__':
     # Run the benchmark - pass the protein, strategy, and num_trials
     # results = runner.run_benchmark(source_protein, denoising_strategy, num_trials=50, verbose=True)
     # Uncomment to use the parallel version:
-    results = runner.run_benchmark_parallel(source_protein, denoising_strategy, num_trials=5, verbose=True, n_processes=8)
+    results = runner.run_benchmark_parallel(source_protein, denoising_strategy, num_trials=120, verbose=False, n_processes=8)
 
     # No need to manually save results - they're automatically saved in the job folder
     print(f"Benchmark complete - results saved in data/benchmarking_results/MaxProbBasedDenoising_*")

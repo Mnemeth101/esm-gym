@@ -27,9 +27,9 @@ runner = BenchmarkRunner(client=model, strategy_name="OneShotDenoising") # Chang
 
 if __name__ == '__main__':
     # Run the benchmark - pass the protein, strategy, and num_trials
-    # results = runner.run_benchmark(source_protein, denoising_strategy, num_trials=50, verbose=True)
+    results = runner.run_benchmark(source_protein, denoising_strategy, num_trials=50, verbose=True)
     # Uncomment to use the parallel version:
-    results = runner.run_benchmark_parallel(source_protein, denoising_strategy, num_trials=3, verbose=True, n_processes=5)
+    # results = runner.run_benchmark_parallel(source_protein, denoising_strategy, num_trials=50, verbose=True, n_processes=8)
 
     # No need to manually save results - they're automatically saved in the job folder
-    print(f"Benchmark complete - results saved in data/benchmarking_results/OneShotDenoising_*") # Changed print statement
+    print(f"Benchmark complete.") # Changed print statement

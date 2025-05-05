@@ -45,7 +45,8 @@ sa_denoiser = SimulatedAnnealingDenoising(
     client=model,
     noise_percentage=NOISE_PERCENTAGE,
     num_decoding_steps=NUM_DECODING_STEPS,
-    base_temperature=BASE_TEMPERATURE
+    base_temperature=BASE_TEMPERATURE,
+    schedule_type='linear' # Added schedule_type
 )
 
 # Test the denoising process

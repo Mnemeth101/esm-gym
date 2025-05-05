@@ -62,6 +62,14 @@ class PrintFormatter:
         
         if increase_indent:
             self.indent_level += 1
+    
+    def decrease_indent(self):
+        """Decrease the indentation level."""
+        self.indent_level = max(0, self.indent_level - 1)
+
+    def increase_indent(self):
+        """Increase the indentation level."""
+        self.indent_level += 1
 
 class BaseDenoisingStrategy(ABC):
     """Abstract base class for denoising strategies."""
@@ -120,7 +128,8 @@ class BaseDenoisingStrategy(ABC):
     def add_noise(
         self,
         protein_tensor: ESMProteinTensor,
-        noise_percentage: float
+        noise_percentage: float,
+        verbose: bool = True # Add verbose parameter
     ) -> ESMProteinTensor:
         """Add noise by masking random positions in the sequence."""
         self.printer.print("Adding noise to protein tensor", increase_indent=True)
@@ -142,8 +151,11 @@ class BaseDenoisingStrategy(ABC):
         protein_tensor.sequence = sequence_tensor
         
         self.printer.print(f"Masked positions: {mask_positions}")
-        self.printer.print(f"Resulting tensor: {protein_tensor.sequence}", 
-                          is_last=True, decrease_indent=True)
+        if verbose: # Make tensor print conditional
+            self.printer.print(f"Resulting tensor: {protein_tensor.sequence}", 
+                              is_last=True, decrease_indent=True)
+        else:
+             self.printer.print(f"Tensor updated.", is_last=True, decrease_indent=True)
         return protein_tensor
     
     def get_number_of_masked_positions(
@@ -232,7 +244,8 @@ class BaseDenoisingStrategy(ABC):
         self,
         protein_tensor: ESMProteinTensor,
         num_positions: int,
-        model_output = None
+        model_output = None,
+        verbose: bool = True # Add verbose parameter
     ) -> list:
         """Get the next positions to unmask based on the strategy."""
         pass
@@ -263,7 +276,7 @@ class BaseDenoisingStrategy(ABC):
         assert not isinstance(protein_tensor, ESMProteinError)
         
         # Add noise by masking positions
-        protein_tensor = self.add_noise(protein_tensor, self.noise_percentage)
+        protein_tensor = self.add_noise(protein_tensor, self.noise_percentage, verbose=verbose) # Pass verbose
         
         # Calculate masked positions
         total_masked = self.get_number_of_masked_positions(protein_tensor)
@@ -311,7 +324,7 @@ class BaseDenoisingStrategy(ABC):
             
             # Get next positions using the same model output
             next_positions = self.get_next_positions(
-                protein_tensor, positions_this_step, output
+                protein_tensor, positions_this_step, output, verbose=verbose # Pass verbose
             )
             
             # Unmask using the same model output
@@ -353,4 +366,4 @@ class BaseDenoisingStrategy(ABC):
             "noise_percentage": self.noise_percentage,
             "num_decoding_steps": self.num_decoding_steps,
             "temperature": self.temperature
-        } 
+        }

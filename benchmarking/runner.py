@@ -32,7 +32,7 @@ def _run_trial(args):
     trial_start = time.time()
     
     # Run denoising strategy
-    denoised_protein = strategy.denoise(protein)
+    denoised_protein = strategy.denoise(protein, verbose=verbose)
     
     # Calculate metrics
     trial_metrics = {}
@@ -76,7 +76,7 @@ class BenchmarkRunner:
     4. Saving results to a JSON file
     """
     
-    def __init__(self, client: ESM3InferenceClient, strategy_name: str, output_dir: str = "benchmark_results"):
+    def __init__(self, client: ESM3InferenceClient, strategy_name: str, output_dir: str = "data/benchmark_results"):
         """
         Initialize the benchmark runner.
         
